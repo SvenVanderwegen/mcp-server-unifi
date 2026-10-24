@@ -4,7 +4,8 @@ One SQLite file holds everything that must survive a restart:
 
 - registered OAuth clients (dynamic client registration),
 - each user's UniFi Site Manager API keys (one per Fabric), encrypted at rest,
-- issued access and refresh tokens.
+- issued access and refresh tokens,
+- the shared Fabric keys added on the admin page (``MCP_AUTH_MODE=entra``).
 
 Tokens are stored as SHA-256 digests, never in the clear: a copy of the file
 must not be enough to call the MCP endpoint as someone. The UniFi API keys
@@ -57,6 +58,13 @@ CREATE TABLE IF NOT EXISTS tokens (
 );
 CREATE INDEX IF NOT EXISTS tokens_user ON tokens (user_id);
 CREATE INDEX IF NOT EXISTS tokens_grant ON tokens (grant_id);
+CREATE TABLE IF NOT EXISTS fabric_keys (
+    key_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at REAL NOT NULL
+);
 """
 
 
@@ -106,6 +114,17 @@ def _decode_keys(plaintext: str) -> tuple[tuple[str, str], ...]:
 
 
 @dataclass(frozen=True)
+class StoredFabricKey:
+    """A shared UniFi key for one Fabric, added on the admin page."""
+
+    key_id: str
+    name: str
+    api_key: str
+    added_by: str
+    added_at: float
+
+
+@dataclass(frozen=True)
 class StoredToken:
     """An issued access or refresh token, looked up by its digest."""
 
@@ -143,6 +162,19 @@ class OAuthStore:
         """Close the underlying database."""
         with self._lock:
             self._db.close()
+
+    # Sealed values (admin session cookies) ------------------------------------
+
+    def seal(self, data: str) -> str:
+        """Encrypt and timestamp a value under MCP_SECRET_KEY."""
+        return self._fernet.encrypt(data.encode("utf-8")).decode("ascii")
+
+    def unseal(self, token: str, ttl: int) -> str | None:
+        """Decrypt a sealed value not older than ``ttl`` seconds, or None."""
+        try:
+            return self._fernet.decrypt(token.encode("ascii"), ttl=ttl).decode("utf-8")
+        except (InvalidToken, UnicodeError):
+            return None
 
     # Clients ----------------------------------------------------------------
 
@@ -224,6 +256,43 @@ class OAuthStore:
         with self._lock:
             self._db.execute("DELETE FROM tokens WHERE user_id = ?", (user_id,))
             self._db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+
+    # Shared Fabric keys -----------------------------------------------------
+
+    def add_fabric_key(self, key_id: str, name: str, api_key: str, added_by: str) -> None:
+        """Store (or replace) a shared Fabric key, encrypted."""
+        encrypted = self._fernet.encrypt(api_key.encode("utf-8")).decode("ascii")
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO fabric_keys (key_id, name, api_key, added_by, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key_id, name, encrypted, added_by, time.time()),
+            )
+
+    def list_fabric_keys(self) -> list[StoredFabricKey]:
+        """All shared Fabric keys, oldest first; keys no secret can decrypt are skipped."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT key_id, name, api_key, added_by, added_at FROM fabric_keys "
+                "ORDER BY added_at, key_id"
+            ).fetchall()
+        keys = []
+        for key_id, name, encrypted, added_by, added_at in rows:
+            try:
+                api_key = self._fernet.decrypt(encrypted.encode("ascii")).decode("utf-8")
+            except InvalidToken:
+                _logger.warning(
+                    "Shared key %s cannot be decrypted with the configured MCP_SECRET_KEY", key_id
+                )
+                continue
+            keys.append(StoredFabricKey(key_id, name, api_key, added_by, added_at))
+        return keys
+
+    def delete_fabric_key(self, key_id: str) -> bool:
+        """Remove a shared Fabric key; returns whether it existed."""
+        with self._lock:
+            cursor = self._db.execute("DELETE FROM fabric_keys WHERE key_id = ?", (key_id,))
+        return cursor.rowcount > 0
 
     # Tokens -----------------------------------------------------------------
 

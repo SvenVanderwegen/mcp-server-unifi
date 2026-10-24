@@ -29,6 +29,7 @@ import sys
 import pytest
 
 from tests.test_auth_http import auth_http_client  # noqa: F401 -- re-exported as a shared fixture
+from tests.test_entra_mode import entra_app  # noqa: F401 -- re-exported as a shared fixture
 from unifi_fabric.client import UniFiClient
 from unifi_fabric.config import APIKeyConfig, Settings
 from unifi_fabric.registry import Registry

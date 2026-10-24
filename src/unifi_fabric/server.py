@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .client import UniFiClient
-from .config import MCPTransportSettings, Settings
+from .config import APIKeyConfig, MCPTransportSettings, Settings
 from .registry import Registry
 from .tools import (
     aggregation,
@@ -82,6 +82,13 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
             raise RuntimeError(
                 "MCP_AUTH_MODE=user_key uses each user's own UniFi API key; "
                 "remove UNIFI_API_KEY / UNIFI_API_KEYS from the environment."
+            )
+    elif _mcp_transport.entra_mode:
+        # Keys can also be added on /admin, so starting without any is fine.
+        if not settings.get_key_configs():
+            logging.getLogger(__name__).warning(
+                "No UNIFI_API_KEYS configured; add the Fabric keys on %s/admin",
+                _mcp_transport.public_url,
             )
     elif not settings.get_key_configs():
         raise RuntimeError(
@@ -458,13 +465,19 @@ def _install_user_key_mode(app: FastMCP) -> None:
 
 
 def _install_entra_mode(app: FastMCP) -> None:
-    """Microsoft sign-in callback and tool-call audit log for ``MCP_AUTH_MODE=entra``."""
-    from .entra_oauth import AuditMiddleware, EntraOAuthProvider, install_entra_routes
+    """Microsoft sign-in, the /admin key page and the tool-call audit log (``entra`` mode)."""
+    from .entra_oauth import AuditMiddleware, EntraOAuthProvider
+    from .key_admin import SharedKeysMiddleware, install_admin_routes
 
     provider = app.auth
     if not isinstance(provider, EntraOAuthProvider):
         raise RuntimeError("MCP_AUTH_MODE=entra requires the Entra OAuth provider")
-    install_entra_routes(app, provider)
+
+    def env_keys() -> list[APIKeyConfig]:
+        return get_settings().env_key_configs()
+
+    install_admin_routes(app, provider, env_keys, get_settings().api_base_url)
+    app.add_middleware(SharedKeysMiddleware(provider.store, env_keys))
     app.add_middleware(AuditMiddleware())
 
 

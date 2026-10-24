@@ -206,10 +206,10 @@ def test_config_requires_entra_app_and_a_real_tenant(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_entra_mode_needs_shared_keys(entra_app, monkeypatch):
-    with pytest.raises(RuntimeError, match="No API key configured"):
-        async with entra_app(UNIFI_API_KEYS="[]") as (_srv, client):
-            await client.get("/health")
+async def test_entra_mode_starts_without_keys(entra_app):
+    # Keys can be added on /admin later, so an empty UNIFI_API_KEYS is not fatal.
+    async with entra_app(UNIFI_API_KEYS="[]") as (_srv, client):
+        assert (await client.get("/health")).status_code == 200
 
 
 # ---------------------------------------------------------------------------
