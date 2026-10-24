@@ -440,14 +440,14 @@ class Settings(BaseSettings):
     def get_key_configs(self) -> list[APIKeyConfig]:
         """Return resolved list of API key configs.
 
-        Inside a per-user request (``MCP_AUTH_MODE=user_key``) the caller's own key
-        is the only one, whatever the environment holds; see ``user_keys``.
+        Inside a per-user request (``MCP_AUTH_MODE=user_key``) the caller's own keys
+        are the only ones, whatever the environment holds; see ``user_keys``.
         """
-        from .user_keys import current_user_key
+        from .user_keys import current_user_keys
 
-        user_key = current_user_key()
-        if user_key is not None:
-            return [user_key]
+        user_keys = current_user_keys()
+        if user_keys:
+            return list(user_keys)
         if self.api_keys:
             return self.api_keys
         if self.api_key:

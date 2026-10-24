@@ -80,5 +80,24 @@ Copilot does not register dynamically, so configure a fixed client:
 
 ## Where users find their key
 
-unifi.ui.com → **API** in the left menu (or Settings → API Keys) →
-**Create API Key**. The key belongs to that person's UI account.
+unifi.ui.com → pick the Fabric in the top-left selector → **API Keys** in the
+left menu → **Create API Key**. The key belongs to that person's UI account and
+only sees the consoles of that one Fabric.
+
+## Several Fabrics
+
+UniFi has no key that spans Fabrics, so someone who works in several pastes one
+key per Fabric on the login page, one per line, optionally named:
+
+```
+VBC: <key from the VBC fabric>
+Klant X: <key from the Klant X fabric>
+```
+
+All keys are checked at login (one refused key fails the login and the page
+names it) and on every revalidation. Inside a request the keys behave like the
+upstream multi-key setup: `list_hosts` and `list_sites` aggregate across all of
+them and tag each item with `_keyLabel`, and per-console tools use the key whose
+Fabric owns the console. The fleet aggregation tools (`list_all_devices`,
+`get_fleet_summary`, ...) use the first key unless given a `key_label` from that
+list. To add or remove a Fabric, reconnect the connector and paste the new set.

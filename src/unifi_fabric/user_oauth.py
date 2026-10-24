@@ -54,10 +54,10 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from .config import MCPTransportSettings
 from .oauth_store import OAuthStore
 from .user_keys import (
-    key_config_for,
+    key_configs_for,
     reset_current_user_key,
-    set_current_user_key,
-    user_id_for_key,
+    set_current_user_keys,
+    user_id_for_keys,
 )
 
 _logger = logging.getLogger(__name__)
@@ -82,8 +82,50 @@ MAX_LOGIN_ATTEMPTS = 5
 KEY_CHECK_TIMEOUT = 15.0
 
 
+# Most keys one login may link: one per UniFi Fabric the user works in.
+MAX_KEYS_PER_USER = 25
+
+
 class KeyRejectedError(Exception):
-    """The Site Manager API refused the key."""
+    """The Site Manager API refused a key.
+
+    ``names`` lists the user's names for the refused keys, when known.
+    """
+
+    def __init__(self, message: str = "", names: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.names = names or []
+
+
+def parse_keys(text: str) -> list[tuple[str, str]]:
+    """Parse the login form's keys field into (name, key) pairs.
+
+    One key per line, optionally prefixed with a name for its Fabric:
+    ``VBC: <key>`` or ``VBC = <key>``. A bare key gets a generated name. Blank
+    lines and repeated keys are skipped.
+
+    Raises:
+        ValueError: More than :data:`MAX_KEYS_PER_USER` keys.
+    """
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        name, key = "", line
+        for sep in (":", "="):
+            head, found, tail = line.partition(sep)
+            if found and head.strip() and tail.strip():
+                name, key = head.strip(), tail.strip()
+                break
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((name or f"fabric{len(entries) + 1}", key))
+    if len(entries) > MAX_KEYS_PER_USER:
+        raise ValueError(f"At most {MAX_KEYS_PER_USER} keys")
+    return entries
 
 
 class UniFiUnreachableError(Exception):
@@ -270,23 +312,31 @@ class UserKeyOAuthProvider(OAuthProvider):
             return None
         return pending
 
-    async def complete_login(self, txn: str, name: str, api_key: str) -> tuple[str, int]:
-        """Check the submitted key and finish the authorization.
+    async def complete_login(
+        self, txn: str, name: str, keys: list[tuple[str, str]] | str
+    ) -> tuple[str, int]:
+        """Check the submitted keys and finish the authorization.
+
+        ``keys`` holds one (name, key) pair per UniFi Fabric, or a single key.
+        Every key must be accepted; one refused key fails the whole login so the
+        user never ends up silently missing a Fabric.
 
         Returns:
             The client redirect URL carrying the authorization code, and the
-            number of consoles the key can see.
+            number of consoles the keys can see together.
 
         Raises:
             AuthorizeError: The login attempt is unknown or used up.
-            KeyRejectedError: The Site Manager API refused the key.
+            KeyRejectedError: The Site Manager API refused a key.
             UniFiUnreachableError: The Site Manager API could not be reached.
         """
+        if isinstance(keys, str):
+            keys = [("fabric1", keys)]
         pending = self.pending_login(txn)
         if pending is None:
             raise AuthorizeError(error="invalid_request", error_description="Login expired")
         try:
-            hosts = await check_api_key(self.api_base_url, api_key)
+            hosts = await self._check_keys(keys)
         except KeyRejectedError:
             pending.attempts += 1
             if pending.attempts >= MAX_LOGIN_ATTEMPTS:
@@ -298,9 +348,15 @@ class UserKeyOAuthProvider(OAuthProvider):
             raise
         self._pending.pop(txn, None)
 
-        user_id = user_id_for_key(api_key)
-        self.store.upsert_user(user_id, name, api_key)
-        _logger.info("User %s (%s) logged in; key sees %d console(s)", user_id, name, hosts)
+        user_id = user_id_for_keys([key for _name, key in keys])
+        self.store.upsert_user(user_id, name, keys)
+        _logger.info(
+            "User %s (%s) logged in with %d key(s); they see %d console(s)",
+            user_id,
+            name,
+            len(keys),
+            hosts,
+        )
 
         code = secrets.token_urlsafe(32)
         params = pending.params
@@ -396,6 +452,24 @@ class UserKeyOAuthProvider(OAuthProvider):
             refresh_token=refresh,
         )
 
+    async def _check_keys(self, keys: list[tuple[str, str]]) -> int:
+        """Check every key concurrently; returns the total console count."""
+        results = await asyncio.gather(
+            *(check_api_key(self.api_base_url, key) for _name, key in keys),
+            return_exceptions=True,
+        )
+        rejected = [
+            name
+            for (name, _key), result in zip(keys, results, strict=True)
+            if isinstance(result, KeyRejectedError)
+        ]
+        if rejected:
+            raise KeyRejectedError("rejected", names=rejected)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return sum(r for r in results if isinstance(r, int))
+
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> UserRefreshToken | None:
@@ -450,7 +524,7 @@ class UserKeyOAuthProvider(OAuthProvider):
                 if user is None:
                     return None
                 if time.time() - user.validated_at > self.settings.oauth_revalidate_interval:
-                    if not await self._revalidate(user.user_id, user.api_key):
+                    if not await self._revalidate(user.user_id, list(user.keys)):
                         return None
         return AccessToken(
             token=token,
@@ -461,12 +535,16 @@ class UserKeyOAuthProvider(OAuthProvider):
             claims={"sub": stored.user_id, "user_id": stored.user_id, "name": user.name},
         )
 
-    async def _revalidate(self, user_id: str, api_key: str) -> bool:
-        """Re-check a stored key. False only when UniFi says the key is no longer valid."""
+    async def _revalidate(self, user_id: str, keys: list[tuple[str, str]]) -> bool:
+        """Re-check stored keys. False only when UniFi says a key is no longer valid."""
         try:
-            await check_api_key(self.api_base_url, api_key)
-        except KeyRejectedError:
-            _logger.info("Stored key of user %s was rejected by UniFi; forgetting it", user_id)
+            await self._check_keys(keys)
+        except KeyRejectedError as exc:
+            _logger.info(
+                "Stored key(s) %s of user %s rejected by UniFi; forgetting the user",
+                ", ".join(exc.names),
+                user_id,
+            )
             self.store.delete_user(user_id)
             return False
         except UniFiUnreachableError as exc:
@@ -497,11 +575,11 @@ class UserKeyOAuthProvider(OAuthProvider):
 
 
 class UserKeyMiddleware(Middleware):
-    """Run every MCP request on the calling user's own UniFi key.
+    """Run every MCP request on the calling user's own UniFi keys.
 
     The transport has already authenticated the bearer token; this looks up the
-    key that token was issued for and places it in the ``user_keys`` context for
-    the duration of the request. A request without one fails rather than
+    keys that token was issued for and places them in the ``user_keys`` context
+    for the duration of the request. A request without one fails rather than
     falling back to any other key.
     """
 
@@ -517,7 +595,7 @@ class UserKeyMiddleware(Middleware):
                 "No UniFi API key is linked to this session. Reconnect the connector "
                 "and log in with your UniFi API key."
             )
-        reset = set_current_user_key(key_config_for(user.api_key))
+        reset = set_current_user_keys(key_configs_for(user.keys))
         try:
             return await call_next(context)
         finally:
@@ -560,9 +638,12 @@ _PAGE = """<!doctype html>
   h1 {{ font-size:1.3rem; margin:0 0 4px; }}
   p {{ margin:0 0 16px; color:var(--muted); }}
   label {{ display:block; font-weight:600; margin:16px 0 6px; }}
-  input {{ width:100%; padding:10px 12px; font:inherit; color:inherit; background:transparent;
-          border:1px solid var(--line); border-radius:8px; }}
-  input:focus {{ outline:2px solid var(--accent); outline-offset:1px; }}
+  input, textarea {{ width:100%; padding:10px 12px; font:inherit; color:inherit;
+          background:transparent; border:1px solid var(--line); border-radius:8px; }}
+  textarea {{ font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.85rem;
+             resize:vertical; -webkit-text-security:disc; }}
+  input:focus, textarea:focus {{ outline:2px solid var(--accent); outline-offset:1px; }}
+  .hint {{ font-size:.85rem; margin:6px 0 0; }}
   .row {{ display:flex; gap:12px; margin-top:24px; }}
   button {{ flex:1; padding:10px 12px; font:inherit; font-weight:600; border-radius:8px;
            cursor:pointer; border:1px solid var(--accent); }}
@@ -583,8 +664,13 @@ _PAGE = """<!doctype html>
     <label for="name">Je naam</label>
     <input id="name" name="name" type="text" autocomplete="name" required maxlength="100"
            value="{name}">
-    <label for="api_key">Persoonlijke UniFi API key</label>
-    <input id="api_key" name="api_key" type="password" autocomplete="off" required>
+    <label for="api_key">Persoonlijke UniFi API key(s)</label>
+    <textarea id="api_key" name="api_key" rows="4" autocomplete="off" spellcheck="false"
+              required
+              placeholder="Eén key per regel, bv.&#10;VBC: abc123&#10;Klant X: def456"></textarea>
+    <p class="hint">Werk je in meerdere fabrics? Een key ziet alleen de fabric waarin hij
+    gemaakt is, dus zet één key per fabric op een eigen regel. De naam voor de dubbele
+    punt is optioneel.</p>
     <div class="row">
       <button class="secondary" type="submit" name="action" value="cancel"
               formnovalidate>Annuleren</button>
@@ -593,8 +679,9 @@ _PAGE = """<!doctype html>
   </form>
   <details>
     <summary>Waar vind ik mijn API key?</summary>
-    Meld je aan op <em>unifi.ui.com</em>, open <em>API</em> in het menu links (of
-    <em>Settings &rarr; API Keys</em>) en kies <em>Create API Key</em>.
+    Meld je aan op <em>unifi.ui.com</em>, kies linksboven de juiste fabric, open
+    <em>API Keys</em> in het menu links en kies <em>Create API Key</em>. Herhaal dat
+    voor elke fabric waarin je werkt.
     De assistent ziet dan precies de consoles die jouw UniFi-account ziet, en alles
     wat hij doet gebeurt met jouw rechten.
   </details>
@@ -653,7 +740,19 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
         form = await request.form()
         txn = str(form.get("txn", ""))
         name = str(form.get("name", "")).strip()[:100]
-        api_key = str(form.get("api_key", "")).strip()
+        try:
+            keys = parse_keys(str(form.get("api_key", "")))
+        except ValueError:
+            return HTMLResponse(
+                _render(
+                    provider,
+                    txn,
+                    message=f"Je kan maximaal {MAX_KEYS_PER_USER} keys tegelijk koppelen.",
+                    name=name,
+                ),
+                status_code=400,
+                headers=_PAGE_HEADERS,
+            )
 
         if form.get("action") == "cancel":
             target = provider.abandon_login(txn)
@@ -663,24 +762,25 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
 
         if provider.pending_login(txn) is None:
             return _expired_page()
-        if not name or not api_key:
+        if not name or not keys:
             return HTMLResponse(
                 _render(provider, txn, message="Vul je naam en API key in.", name=name),
                 status_code=400,
                 headers=_PAGE_HEADERS,
             )
         try:
-            target, _hosts = await provider.complete_login(txn, name, api_key)
-        except KeyRejectedError:
+            target, _hosts = await provider.complete_login(txn, name, keys)
+        except KeyRejectedError as exc:
             if provider.pending_login(txn) is None:
                 return _expired_page()
+            which = ", ".join(exc.names) if len(keys) > 1 else ""
+            message = (
+                f"UniFi aanvaardt deze key(s) niet: {which}. Controleer ze en probeer opnieuw."
+                if which
+                else "UniFi aanvaardt deze API key niet. Controleer hem en probeer opnieuw."
+            )
             return HTMLResponse(
-                _render(
-                    provider,
-                    txn,
-                    message="UniFi aanvaardt deze API key niet. Controleer hem en probeer opnieuw.",
-                    name=name,
-                ),
+                _render(provider, txn, message=message, name=name),
                 status_code=401,
                 headers=_PAGE_HEADERS,
             )
