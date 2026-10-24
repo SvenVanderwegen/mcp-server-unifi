@@ -35,9 +35,10 @@ client ──/mcp, Bearer token──▶ tools run on UNIFI_API_KEYS
   the user's name and e-mail: `Tool call get_host by Jan Peeters <jan@…>`.
 - Inside a request the keys behave like the upstream multi-key setup:
   `list_hosts` / `list_sites` aggregate across all keys, per-console tools use
-  the key of the Fabric that owns the console. The fleet aggregation tools
-  (`list_all_devices`, `get_fleet_summary`, ...) use the first key unless given a
-  `key_label`.
+  the key of the Fabric that owns the console. The fleet tools
+  (`list_all_devices`, `list_all_clients`, `get_fleet_summary`,
+  `search_device_fleet`, `list_devices`) also cover every key, unless given a
+  `key_label` to scope to one Fabric.
 
 ## 1. Register the app in Microsoft Entra
 

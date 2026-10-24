@@ -1455,13 +1455,14 @@ List all connected clients across all sites.
 
 Fans out requests to every site and aggregates results with source
 host/site annotations on each client record.
-key_label: scope query to consoles visible to a specific API key.
+key_label: scope query to consoles visible to a specific API key. Omitted with
+several keys configured: every key's sites, each client tagged with _keyLabel.
 
 **Parameters**
 
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `key_label` | `string | null` | no | `null` | scope query to consoles visible to a specific API key. |
+| `key_label` | `string | null` | no | `null` | scope query to consoles visible to a specific API key. Omitted with |
 
 **Return type**
 
@@ -1479,7 +1480,8 @@ nothing and returns an EMPTY device list, so a typo (e.g. 'ofline') looks like a
 healthy fleet with zero problem devices rather than an error. Omit status_filter to
 get the full fleet, then read the real status values off the returned records.
 key_label: scope query to a specific API key
-(use list_configured_api_keys to see available keys).
+(use list_configured_api_keys to see available keys). Omitted with several
+keys configured: every key's devices, each tagged with _keyLabel.
 
 **Parameters**
 
@@ -4321,13 +4323,14 @@ zone_id: REQUIRED. Obtain it from `list_firewall_zones_proxy` (its id field).
 Get a high-level fleet summary: host, site, and device counts with status breakdowns.
 
 Useful for a quick overview of the entire UniFi deployment.
-key_label: scope summary to consoles visible to a specific API key.
+key_label: scope summary to consoles visible to a specific API key. Omitted with
+several keys configured: totals over every key, plus a per-key breakdown (byKey).
 
 **Parameters**
 
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `key_label` | `string | null` | no | `null` | scope summary to consoles visible to a specific API key. |
+| `key_label` | `string | null` | no | `null` | scope summary to consoles visible to a specific API key. Omitted with |
 
 **Return type**
 
@@ -5316,7 +5319,8 @@ query: search term matched against name, MAC address, IP, or model.
 Search for a device by name, MAC address, or model across the entire fleet.
 
 Returns all matching devices from all consoles.
-key_label: scope search to consoles visible to a specific API key.
+key_label: scope search to consoles visible to a specific API key. Omitted with
+several keys configured: searches every key's devices.
 query: REQUIRED. Search string matched against device name, model, and MAC across the fleet.
 
 **Parameters**
@@ -5324,7 +5328,7 @@ query: REQUIRED. Search string matched against device name, model, and MAC acros
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `query` | `string` | yes |  | REQUIRED. Search string matched against device name, model, and MAC across the fleet. |
-| `key_label` | `string | null` | no | `null` | scope search to consoles visible to a specific API key. |
+| `key_label` | `string | null` | no | `null` | scope search to consoles visible to a specific API key. Omitted with |
 
 **Return type**
 
