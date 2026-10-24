@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - With several API keys configured (one per Fabric), the fleet tools `list_all_devices`, `list_all_clients`, `get_fleet_summary`, `search_device_fleet` and `list_devices` (without `host`) now cover every key's org when no `key_label` is given, instead of only the first key. Records are tagged with `_keyLabel`, `get_fleet_summary` adds a per-key `byKey` breakdown, and a failing key is reported under `errors` without hiding the others. Passing `key_label` still scopes to one key.
+
+### Fixed
+- The `host` parameter of per-console tools now finds a console by the name Site Manager shows (`reportedState.name`), case- and whitespace-insensitive, so names with spaces, dots or parentheses work, and by its MAC address in any notation. Before, such names were rejected as an invalid host id and a bare MAC went to the first key, giving "403 host not found" for consoles of other Fabrics. An unknown name now says it was not found and points to `list_hosts`.
 - `docker-compose.yml` and `.env.example` for a Traefik/Portainer deployment of the per-user mode, with a `/data` volume.
 
 ## [0.6.2] - 2026-08-16
