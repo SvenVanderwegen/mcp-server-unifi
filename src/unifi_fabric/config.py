@@ -8,6 +8,21 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
 
+# Redirect hosts a dynamically registered OAuth client may use by default in
+# user_key mode: Claude, Copilot Studio / Power Platform consent, local clients.
+# Microsoft 365 Copilot does not register dynamically; it uses the
+# pre-registered client and its redirect URIs instead.
+DEFAULT_OAUTH_REDIRECT_HOSTS = (
+    "claude.ai",
+    "claude.com",
+    "global.consent.azure-apim.net",
+    ".consent.azure-apim.net",
+    "localhost",
+    "127.0.0.1",
+)
+
+MIN_SECRET_LENGTH = 32
+
 
 class APIKeyConfig(BaseSettings):
     """Configuration for a single UniFi Site Manager API key."""
@@ -81,10 +96,10 @@ class MCPTransportSettings(BaseSettings):
     )
 
     # --- Auth selector -------------------------------------------------------
-    auth_mode: Literal["none", "bearer", "oauth"] | None = Field(
+    auth_mode: Literal["none", "bearer", "oauth", "user_key"] | None = Field(
         default=None,
-        description="Auth mode selector (MCP_AUTH_MODE): one of 'none', 'bearer', 'oauth'. "
-        "Unset resolves from bearer_token for backward compatibility.",
+        description="Auth mode selector (MCP_AUTH_MODE): one of 'none', 'bearer', 'oauth', "
+        "'user_key'. Unset resolves from bearer_token for backward compatibility.",
     )
     oauth_issuer: str = Field(
         default="",
@@ -120,6 +135,51 @@ class MCPTransportSettings(BaseSettings):
         "(MCP_OAUTH_AUTHORIZATION_SERVERS). Defaults to [oauth_issuer] when unset.",
     )
 
+    # --- Per-user key mode (auth_mode='user_key') ---------------------------
+    # The server is its own OAuth authorization server. Each person logs in on
+    # its /oauth/login page with their own UniFi Site Manager API key, and every
+    # call made with the resulting token uses that key. See user_oauth.py.
+    public_url: str = Field(
+        default="",
+        description="Public https:// base URL clients reach this server at, without the "
+        "/mcp path (MCP_PUBLIC_URL). Required when auth_mode='user_key'.",
+    )
+    secret_key: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description="Secret(s) that encrypt the stored UniFi API keys (MCP_SECRET_KEY), "
+        "comma-separated for rotation: the first encrypts, all decrypt. Required when "
+        "auth_mode='user_key'; at least 32 characters each.",
+    )
+    oauth_db_path: str = Field(
+        default="unifi-mcp-oauth.sqlite3",
+        description="SQLite file holding OAuth clients, tokens and encrypted user keys "
+        "(MCP_OAUTH_DB_PATH). Put it on a volume.",
+    )
+    oauth_access_token_ttl: int = Field(default=3600, gt=0)
+    oauth_refresh_token_ttl: int = Field(default=30 * 24 * 3600, gt=0)
+    oauth_revalidate_interval: int = Field(
+        default=900,
+        gt=0,
+        description="Seconds between re-checks of a stored key against the Site Manager "
+        "API (MCP_OAUTH_REVALIDATE_INTERVAL). A key deleted in UniFi stops working "
+        "within this window.",
+    )
+    oauth_allowed_redirect_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: list(DEFAULT_OAUTH_REDIRECT_HOSTS),
+        description="Hosts a dynamically registered client may redirect to "
+        "(MCP_OAUTH_ALLOWED_REDIRECT_HOSTS); a leading '.' matches subdomains.",
+    )
+    oauth_client_id: str = Field(
+        default="",
+        description="Optional pre-registered OAuth client, for clients without dynamic "
+        "registration such as Microsoft 365 Copilot (MCP_OAUTH_CLIENT_ID).",
+    )
+    oauth_client_secret: str = Field(default="")
+    oauth_client_redirect_uris: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    oauth_client_auth_method: Literal["client_secret_post", "client_secret_basic"] = Field(
+        default="client_secret_post"
+    )
+
     # --- TLS selector --------------------------------------------------------
     tls_mode: Literal["none", "https", "mtls"] = Field(
         default="none",
@@ -151,7 +211,14 @@ class MCPTransportSettings(BaseSettings):
     )
 
     # --- Field-level normalisation / enum guards -----------------------------
-    @field_validator("oauth_required_scopes", "oauth_authorization_servers", mode="before")
+    @field_validator(
+        "oauth_required_scopes",
+        "oauth_authorization_servers",
+        "secret_key",
+        "oauth_allowed_redirect_hosts",
+        "oauth_client_redirect_uris",
+        mode="before",
+    )
     @classmethod
     def _split_csv(cls, v: object) -> object:
         """Parse a comma-separated env string into a list (JSON decoding disabled)."""
@@ -166,7 +233,7 @@ class MCPTransportSettings(BaseSettings):
     def _validate_auth_mode(cls, v: object) -> object:
         if v is None or v == "":
             return None
-        valid = ("none", "bearer", "oauth")
+        valid = ("none", "bearer", "oauth", "user_key")
         if v not in valid:
             raise ValueError(f"MCP_AUTH_MODE must be one of {', '.join(valid)} (got {v!r})")
         return v
@@ -225,6 +292,9 @@ class MCPTransportSettings(BaseSettings):
             if not self.oauth_authorization_servers:
                 self.oauth_authorization_servers = [self.oauth_issuer]
 
+        if self.auth_mode == "user_key":
+            self._validate_user_key_mode()
+
         # HTTPS/mTLS require a server cert + key; mTLS additionally a client CA.
         if self.tls_mode in ("https", "mtls"):
             missing = [
@@ -268,6 +338,45 @@ class MCPTransportSettings(BaseSettings):
                 "MCP_AUTH_MODE/MCP_BEARER_TOKEN and MCP_TLS_MODE."
             )
         return self
+
+    def _validate_user_key_mode(self) -> None:
+        """Fail closed on an incomplete per-user key configuration."""
+        from urllib.parse import urlparse
+
+        if not self.public_url:
+            raise ValueError(
+                "auth_mode='user_key' requires MCP_PUBLIC_URL, the https:// URL clients "
+                "reach this server at (without /mcp)"
+            )
+        parsed = urlparse(self.public_url)
+        loopback = parsed.hostname in {"localhost", "127.0.0.1"}
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+            raise ValueError("MCP_PUBLIC_URL must be an https:// URL")
+        if parsed.path not in ("", "/"):
+            raise ValueError("MCP_PUBLIC_URL must not contain a path; give the bare origin")
+        self.public_url = self.public_url.rstrip("/")
+        if not self.secret_key:
+            raise ValueError(
+                "auth_mode='user_key' requires MCP_SECRET_KEY, used to encrypt the stored "
+                "UniFi API keys (generate one with: openssl rand -hex 32)"
+            )
+        if any(len(k) < MIN_SECRET_LENGTH for k in self.secret_key):
+            raise ValueError(f"MCP_SECRET_KEY must be at least {MIN_SECRET_LENGTH} characters")
+        if bool(self.oauth_client_id) != bool(self.oauth_client_secret):
+            raise ValueError("MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET must be set together")
+        if self.oauth_client_id and not self.oauth_client_redirect_uris:
+            raise ValueError(
+                "A pre-registered client (MCP_OAUTH_CLIENT_ID) needs MCP_OAUTH_CLIENT_REDIRECT_URIS"
+            )
+        if self.oauth_client_secret and len(self.oauth_client_secret) < MIN_SECRET_LENGTH:
+            raise ValueError(
+                f"MCP_OAUTH_CLIENT_SECRET must be at least {MIN_SECRET_LENGTH} characters"
+            )
+
+    @property
+    def user_key_mode(self) -> bool:
+        """Whether each request runs on the calling user's own UniFi key."""
+        return self.auth_mode == "user_key"
 
 
 class Settings(BaseSettings):
@@ -329,7 +438,16 @@ class Settings(BaseSettings):
     )
 
     def get_key_configs(self) -> list[APIKeyConfig]:
-        """Return resolved list of API key configs."""
+        """Return resolved list of API key configs.
+
+        Inside a per-user request (``MCP_AUTH_MODE=user_key``) the caller's own key
+        is the only one, whatever the environment holds; see ``user_keys``.
+        """
+        from .user_keys import current_user_key
+
+        user_key = current_user_key()
+        if user_key is not None:
+            return [user_key]
         if self.api_keys:
             return self.api_keys
         if self.api_key:

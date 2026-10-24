@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from cachetools import TTLCache
 
 from .client import PaginationAbortedError, validate_host_id
+from .user_keys import current_user_key
 
 if TYPE_CHECKING:
     from .client import UniFiClient
@@ -80,7 +81,13 @@ class Registry:
         self._ea_sites_full_warned = False
 
     def _key_label(self, key: APIKeyConfig | None) -> str:
-        return key.label if key is not None else _DEFAULT_LABEL
+        if key is not None:
+            return key.label
+        # Per-user mode: a call without an explicit key runs on the caller's own
+        # key, so it must also land in the caller's own cache entries. A shared
+        # "__default__" entry would serve one person's host list to the next.
+        user_key = current_user_key()
+        return user_key.label if user_key is not None else _DEFAULT_LABEL
 
     def _check_cache_pressure(self, cache: TTLCache, name: str, warned_attr: str) -> None:
         """Log WARNING once when cache first fills; log INFO when pressure drops below 50%."""

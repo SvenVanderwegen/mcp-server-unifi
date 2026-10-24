@@ -5,6 +5,8 @@ dist/
 build/
 .venv/
 .env*
+!.env.example
+stack.env
 .mcp.json
 *.egg
 .ruff_cache/

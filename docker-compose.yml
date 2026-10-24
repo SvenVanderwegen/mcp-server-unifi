@@ -1,0 +1,79 @@
+# Remote UniFi MCP server with per-user keys, behind an existing Traefik on the
+# `proxy` network. Every person logs in with their own UniFi Site Manager API key.
+#
+# Deploy:  docker compose up -d --build
+# Config:  cp .env.example stack.env   (Portainer writes stack.env for you)
+services:
+  unifi-mcp:
+    build: .
+    # A local tag on purpose. Naming the upstream image would let any pull
+    # (`docker compose pull`, Portainer's "re-pull and redeploy") replace this
+    # build with upstream's, which has no per-user login.
+    image: unifi-mcp:local
+    # Build rather than reuse whatever is tagged unifi-mcp:local, so a git pull
+    # actually reaches the container.
+    pull_policy: build
+    container_name: unifi-mcp
+    restart: unless-stopped
+
+    env_file:
+      - stack.env
+
+    environment:
+      FASTMCP_TRANSPORT: streamable-http
+      FASTMCP_HOST: 0.0.0.0
+      FASTMCP_PORT: 3000
+      MCP_AUTH_MODE: user_key
+      # Each person may do whatever their own UniFi account allows, so the
+      # guarded generic connector relay is on too (each mutation still needs
+      # confirm=true). Mobility and Carrier writes stay at upstream's default.
+      UNIFI_ENABLE_CONNECTOR_WRITE: "true"
+      # Survives rebuilds, so nobody has to paste their key again after a deploy.
+      MCP_OAUTH_DB_PATH: /data/oauth.sqlite3
+
+    volumes:
+      - unifi-mcp-data:/data
+
+    # No `ports:` on purpose: Traefik reaches the container over `proxy`, and a
+    # published host port would be a second way in that skips TLS.
+
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.services.unifi-mcp.loadbalancer.server.port=3000
+      - traefik.http.routers.unifi-mcp.rule=Host(`${SUBDOMAIN}.${DOMAIN_NAME}`)
+      - traefik.http.routers.unifi-mcp.entrypoints=web,websecure
+      - traefik.http.routers.unifi-mcp.tls=true
+      - traefik.http.routers.unifi-mcp.tls.certresolver=le
+      - traefik.http.routers.unifi-mcp.middlewares=unifi-mcp@docker
+      - traefik.http.middlewares.unifi-mcp.headers.SSLRedirect=true
+      - traefik.http.middlewares.unifi-mcp.headers.STSSeconds=315360000
+      - traefik.http.middlewares.unifi-mcp.headers.browserXSSFilter=true
+      - traefik.http.middlewares.unifi-mcp.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.unifi-mcp.headers.forceSTSHeader=true
+      - traefik.http.middlewares.unifi-mcp.headers.SSLHost=${DOMAIN_NAME}
+      - traefik.http.middlewares.unifi-mcp.headers.STSIncludeSubdomains=true
+      - traefik.http.middlewares.unifi-mcp.headers.STSPreload=true
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    networks:
+      - proxy
+
+volumes:
+  unifi-mcp-data:
+
+networks:
+  proxy:
+    external: true
