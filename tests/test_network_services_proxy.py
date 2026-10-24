@@ -1655,3 +1655,104 @@ class TestListDpiApplications:
         client.get.assert_called_once_with(
             f"{BASE}/dpi/applications", key=None, params={"limit": 25}
         )
+
+
+# --- list_traffic_flows (read-only POST search) ---
+
+_FLOW_HOST = "console-beta-1"
+_FLOW_SITES = [
+    {
+        "id": "bbbbbbbb-0000-4000-8000-000000000001",
+        "description": "Example Brothers",
+        "internalReference": "default",
+    }
+]
+
+
+async def _flow_registry(client):
+    from tests.conftest import MULTIKEY_HOSTS_BY_LABEL
+    from unifi_fabric.registry import Registry
+
+    registry = Registry(client, ttl_seconds=900)
+    for label, hosts in MULTIKEY_HOSTS_BY_LABEL.items():
+        await registry.set_hosts(hosts, key=client.get_key_by_label(label))
+    await registry.set_sites(_FLOW_HOST, list(_FLOW_SITES), key=client.get_key_by_label("beta"))
+    return registry
+
+
+async def test_list_traffic_flows_posts_the_search_with_the_owning_key(multikey_client):
+    from unifi_fabric.tools.network_services_proxy import list_traffic_flows
+
+    registry = await _flow_registry(multikey_client)
+    multikey_client.post = AsyncMock(return_value={"data": [{"id": "flow-1"}], "total": 1})
+    result = await list_traffic_flows(
+        multikey_client,
+        registry,
+        "Beta-Branch",
+        "Example Brothers",
+        start=1_700_000_000,
+        end=1_700_003_600,
+        action=["Blocked"],
+        risk=["high", "medium"],
+        page_size=5000,
+    )
+    assert result == {"data": [{"id": "flow-1"}], "total": 1}
+    call = multikey_client.post.await_args
+    assert (
+        call.args[0]
+        == _V2_API_BASE.format(host_id=_FLOW_HOST, site_slug="default") + "/traffic-flows"
+    )
+    assert call.kwargs["key"].label == "beta"
+    assert call.kwargs["json"] == {
+        "timestampFrom": 1_700_000_000_000,
+        "timestampTo": 1_700_003_600_000,
+        "pageNumber": 0,
+        "pageSize": 5000,
+        "action": ["blocked"],
+        "risk": ["high", "medium"],
+    }
+
+
+async def test_list_traffic_flows_defaults_to_the_last_hour_on_site_default(multikey_client):
+    from unifi_fabric.tools.network_services_proxy import list_traffic_flows
+
+    registry = await _flow_registry(multikey_client)
+    multikey_client.post = AsyncMock(return_value={"data": []})
+    # The site was renamed in the UI; its slug is still "default".
+    await list_traffic_flows(multikey_client, registry, _FLOW_HOST)
+    body = multikey_client.post.await_args.kwargs["json"]
+    assert body["timestampTo"] - body["timestampFrom"] == 3_600_000
+    assert set(body) == {"timestampFrom", "timestampTo", "pageNumber", "pageSize"}
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"start": 10, "end": 5}, "must be before end"),
+        ({"end": 1_700_000_000_000}, "looks like epoch milliseconds"),
+        ({"page_size": 0}, "page_size must be between 1 and 5000"),
+        ({"page_size": 5001}, "page_size must be between 1 and 5000"),
+        ({"page_number": -1}, "page_number must be"),
+        ({"direction": ["sideways"]}, "direction must be"),
+        ({"action": []}, "action must be"),
+    ],
+)
+async def test_list_traffic_flows_rejects_bad_input_before_any_call(
+    multikey_client, kwargs, message
+):
+    from unifi_fabric.tools.network_services_proxy import list_traffic_flows
+
+    registry = await _flow_registry(multikey_client)
+    multikey_client.post = AsyncMock()
+    with pytest.raises(ValueError, match=message):
+        await list_traffic_flows(multikey_client, registry, _FLOW_HOST, **kwargs)
+    multikey_client.post.assert_not_awaited()
+
+
+async def test_site_slug_and_uuid_resolve_by_internal_reference(multikey_client):
+    registry = await _flow_registry(multikey_client)
+    beta = multikey_client.get_key_by_label("beta")
+    assert await registry.resolve_site_slug("Default", _FLOW_HOST, key=beta) == "default"
+    assert await registry.resolve_site_id("default", _FLOW_HOST, key=beta) == _FLOW_SITES[0]["id"]
+    with pytest.raises(ValueError, match="not found"):
+        await registry.resolve_site_slug("elsewhere", _FLOW_HOST, key=beta)

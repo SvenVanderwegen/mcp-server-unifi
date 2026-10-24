@@ -40,6 +40,20 @@ def _norm_mac(value: str) -> str:
     return mac if _MAC_RE.match(mac) else ""
 
 
+def _site_by_slug(sites: list[dict[str, Any]], name_or_id: str) -> dict[str, Any] | None:
+    """The site whose ``internalReference`` (e.g. ``default``) equals ``name_or_id``.
+
+    Checked after id and label: a console whose only site was renamed in the UI
+    still has the slug ``default``, so ``site="default"`` keeps working there.
+    """
+    needle = name_or_id.strip().lower()
+    for site in sites:
+        ref = site.get("internalReference")
+        if isinstance(ref, str) and ref.lower() == needle:
+            return site
+    return None
+
+
 def _host_matches(host: dict[str, Any], name_or_id: str) -> bool:
     """Whether ``name_or_id`` names this ``/v1/hosts`` record.
 
@@ -291,7 +305,8 @@ class Registry:
     ) -> str:
         """Resolve a site name or UUID to a UUID site ID via the console proxy.
 
-        Matches on ``id`` (exact UUID), ``description``, or ``name`` (both case-insensitive).
+        Matches on ``id`` (exact UUID), ``description``, or ``name`` (both case-insensitive),
+        then on the ``internalReference`` slug (e.g. ``default``).
         The Network Integration API may return either ``description`` or ``name`` for the
         human-readable site label depending on the firmware version; both are checked.
         Raises ValueError if the site cannot be found or the resolved ID is not a valid UUID.
@@ -308,6 +323,11 @@ class Registry:
             if site_label and site_label == name_or_id.lower():
                 _assert_uuid(site_id)
                 return site_id
+        by_slug = _site_by_slug(sites, name_or_id)
+        if by_slug is not None:
+            site_id = cast(str, by_slug.get("id") or by_slug.get("_id", ""))
+            _assert_uuid(site_id)
+            return site_id
         raise ValueError(
             f"Site {name_or_id!r} not found on host {host_id!r}. "
             "Pass the site name or UUID as shown in list_sites output."
@@ -319,7 +339,8 @@ class Registry:
         """Resolve a site name or UUID to its internalReference slug (e.g. 'default').
 
         Used for Classic REST and v2 API endpoints that require the site slug rather than
-        the UUID. Looks up ``internalReference`` from the proxy sites data.
+        the UUID. Looks up ``internalReference`` from the proxy sites data; the slug itself
+        (e.g. ``default``) is accepted too, also when the site's label was renamed.
         Falls back to the lower-cased description/name if internalReference is absent.
         Raises ValueError if the site cannot be found.
         """
@@ -333,6 +354,11 @@ class Registry:
                 slug = cast(str, site.get("internalReference") or site_label or name_or_id)
                 validate_id(slug, "site_slug")
                 return slug
+        by_slug = _site_by_slug(sites, name_or_id)
+        if by_slug is not None:
+            slug = cast(str, by_slug["internalReference"])
+            validate_id(slug, "site_slug")
+            return slug
         raise ValueError(
             f"Site {name_or_id!r} not found on host {host_id!r}. "
             "Pass the site name or UUID as shown in list_sites output."

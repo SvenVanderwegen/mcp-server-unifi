@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ..client import UniFiClient, validate_id
 from ..config import APIKeyConfig
 from ..registry import Registry, _assert_uuid
+from ._history_common import require_epoch_seconds, seconds_to_millis
 from ._pagination import collect_offset, mark_incomplete
 from ._payload import require_fields, sanitize_integration_write, strip_empty_list_values
 from .network import _proxy
@@ -514,6 +516,80 @@ async def list_traffic_rules(
     if isinstance(result, list):
         return {"data": result, "count": len(result)}
     return result
+
+
+_FLOW_FILTERS: dict[str, frozenset[str]] = {
+    "direction": frozenset({"incoming", "outgoing", "local"}),
+    "action": frozenset({"allowed", "blocked"}),
+    "risk": frozenset({"low", "medium", "high"}),
+}
+_FLOW_MAX_PAGE_SIZE = 5000
+
+
+def _flow_filter(name: str, values: list[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    allowed = _FLOW_FILTERS[name]
+    cleaned = [v.strip().lower() for v in values]
+    bad = sorted(set(cleaned) - allowed)
+    if bad or not cleaned:
+        raise ValueError(f"{name} must be a non-empty list of {sorted(allowed)}, got {values!r}")
+    return cleaned
+
+
+async def list_traffic_flows(
+    client: UniFiClient,
+    registry: Registry,
+    host: str,
+    site: str = "default",
+    *,
+    start: int | None = None,
+    end: int | None = None,
+    direction: list[str] | None = None,
+    action: list[str] | None = None,
+    risk: list[str] | None = None,
+    page_number: int = 0,
+    page_size: int = 1000,
+) -> Any:
+    """Read the traffic flow log (Insights > Flows) of a site. Read-only.
+
+    The console serves flows only as a search: ``POST
+    /proxy/network/v2/api/site/{site}/traffic-flows`` (a GET answers 405). The
+    POST changes nothing on the console, so this tool is not behind the
+    connector write gate. ``start``/``end`` are epoch **seconds** (converted to
+    the milliseconds the endpoint takes); the default window is the last hour.
+    ``direction``/``action``/``risk`` filter server-side. Pages hold at most
+    5000 flows and a query returns at most 10,000, so narrow the window or the
+    filters for busy sites. The response is returned verbatim.
+    """
+    end_s = require_epoch_seconds(end, "end") if end is not None else int(time.time())
+    start_s = require_epoch_seconds(start, "start") if start is not None else end_s - 3600
+    if start_s >= end_s:
+        raise ValueError(f"start ({start_s}) must be before end ({end_s})")
+    if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 0:
+        raise ValueError(f"page_number must be an integer >= 0, got {page_number!r}")
+    if (
+        isinstance(page_size, bool)
+        or not isinstance(page_size, int)
+        or not 1 <= page_size <= _FLOW_MAX_PAGE_SIZE
+    ):
+        raise ValueError(
+            f"page_size must be between 1 and {_FLOW_MAX_PAGE_SIZE}, got {page_size!r}"
+        )
+    body: dict[str, Any] = {
+        "timestampFrom": seconds_to_millis(start_s),
+        "timestampTo": seconds_to_millis(end_s),
+        "pageNumber": page_number,
+        "pageSize": page_size,
+    }
+    for name, values in (("direction", direction), ("action", action), ("risk", risk)):
+        cleaned = _flow_filter(name, values)
+        if cleaned is not None:
+            body[name] = cleaned
+    key = await registry.resolve_key_for_host(host)
+    host_id = await registry.resolve_host_id(host, key=key)
+    site_slug = await registry.resolve_site_slug(site, host_id, key=key)
+    return await client.post(_v2_api(host_id, site_slug, "/traffic-flows"), key=key, json=body)
 
 
 async def create_traffic_rule(
