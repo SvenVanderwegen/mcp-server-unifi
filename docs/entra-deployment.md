@@ -56,11 +56,37 @@ entra.microsoft.com → Identity → Applications → App registrations → New 
 From the Overview page note the **Application (client) ID** and the
 **Directory (tenant) ID**.
 
+6. App roles → Create app role: display name `UniFi admin`, allowed member
+   types Users/Groups, value **`UniFi.Admin`** (or set `MCP_ENTRA_ADMIN_ROLE` to
+   your own value). Then Enterprise applications → `UniFi MCP` → Users and
+   groups → assign that role to the people who manage the keys.
+
 ## 2. Create the Fabric keys
 
 For each Fabric: unifi.ui.com → pick the Fabric in the top-left selector →
 **API Keys** → **Create API Key**. Ideally create them with a dedicated service
 account, so the keys do not depend on one person's account.
+
+Add them on the admin page (next section) or in `UNIFI_API_KEYS`; both work
+together.
+
+## Managing keys on `/admin`
+
+`https://<host>/admin` signs you in with Microsoft and opens only for accounts
+with the `UniFi.Admin` app role. It lists every key (masked to the last four
+characters), and lets you:
+
+- **add** a key with a name for its Fabric: it is tested against `/v1/hosts`
+  first, then stored Fernet-encrypted (`MCP_SECRET_KEY`) in the SQLite store on
+  the `/data` volume, and used from the very next request. No redeploy.
+- **test** a key: shows how many consoles it sees, or that UniFi refuses it.
+- **remove** a key: it stops being used on the next request.
+
+Keys from `UNIFI_API_KEYS` are listed too but can only be changed in the stack.
+Every change is logged with the admin's name. The admin session is an
+encrypted, HttpOnly cookie on `/admin`, valid for 8 hours; forms carry a CSRF
+token. The server starts fine with no keys at all and logs a reminder to add
+them on `/admin`.
 
 ## 3. Stack environment
 
@@ -71,11 +97,13 @@ MCP_SECRET_KEY=<openssl rand -hex 32>
 MCP_ENTRA_TENANT_ID=<Directory (tenant) ID>
 MCP_ENTRA_CLIENT_ID=<Application (client) ID>
 MCP_ENTRA_CLIENT_SECRET=<client secret value>
+# Optional: keys can also (or only) be managed on /admin
 UNIFI_API_KEYS=[{"key":"<key fabric 1>","label":"vbc"},{"key":"<key fabric 2>","label":"klant-x"}]
+# MCP_ENTRA_ADMIN_ROLE=UniFi.Admin
 ```
 
 `UNIFI_API_KEYS` is a JSON list; the labels show up as `_keyLabel` on hosts and
-sites. The Copilot client (`MCP_OAUTH_CLIENT_*`) is configured as in
+sites (keys added on `/admin` get their name plus a short digest). The Copilot client (`MCP_OAUTH_CLIENT_*`) is configured as in
 [per-user-deployment.md](per-user-deployment.md#connect-microsoft-365-copilot).
 
 Switching from `user_key` mode: existing logins stop working (they hold UniFi

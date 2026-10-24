@@ -197,6 +197,12 @@ class MCPTransportSettings(BaseSettings):
         default="",
         description="Client secret of the Entra app registration (MCP_ENTRA_CLIENT_SECRET).",
     )
+    entra_admin_role: str = Field(
+        default="UniFi.Admin",
+        description="App role (value) that opens the /admin page for managing the shared "
+        "Fabric keys (MCP_ENTRA_ADMIN_ROLE). Define it on the app registration and assign "
+        "it to the admins.",
+    )
 
     # --- TLS selector --------------------------------------------------------
     tls_mode: Literal["none", "https", "mtls"] = Field(
@@ -497,6 +503,10 @@ class Settings(BaseSettings):
         user_keys = current_user_keys()
         if user_keys:
             return list(user_keys)
+        return self.env_key_configs()
+
+    def env_key_configs(self) -> list[APIKeyConfig]:
+        """The keys from the environment (UNIFI_API_KEYS / UNIFI_API_KEY) alone."""
         if self.api_keys:
             return self.api_keys
         if self.api_key:

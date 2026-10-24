@@ -35,6 +35,7 @@ import json
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
@@ -70,6 +71,8 @@ ENTRA_SCOPES = "openid profile email offline_access"
 REFRESH_ENTRY = "entra-refresh-token"
 
 ENTRA_TIMEOUT = 15.0
+
+MAX_ADMIN_PENDING = 1000
 
 # Token errors that mean Entra no longer vouches for the user.
 _REJECTING_ERRORS = {"invalid_grant", "interaction_required", "consent_required"}
@@ -118,6 +121,8 @@ class EntraOAuthProvider(UserKeyOAuthProvider):
         self.endpoint = f"{ENTRA_AUTHORITY}/{self.tenant_id}/oauth2/v2.0"
         self.issuer = f"{ENTRA_AUTHORITY}/{self.tenant_id}/v2.0"
         self.callback_url = f"{self.public_url}{CALLBACK_PATH}"
+        # Admin-page sign-ins in flight: txn -> (PKCE verifier, expiry).
+        self._admin_pending: dict[str, tuple[str, float]] = {}
 
     # Authorization ----------------------------------------------------------
 
@@ -136,6 +141,9 @@ class EntraOAuthProvider(UserKeyOAuthProvider):
             expires_at=time.time() + PENDING_LOGIN_TTL,
             verifier=verifier,
         )
+        return self._entra_authorize_url(txn, verifier)
+
+    def _entra_authorize_url(self, txn: str, verifier: str) -> str:
         query = urlencode(
             {
                 "client_id": self.settings.entra_client_id,
@@ -164,15 +172,7 @@ class EntraOAuthProvider(UserKeyOAuthProvider):
         pending = self._pending.pop(txn, None)
         if not isinstance(pending, _EntraPending) or pending.expires_at < time.time() or not code:
             raise AuthorizeError(error="invalid_request", error_description="Login expired")
-        tokens = await self._token_request(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": self.callback_url,
-                "code_verifier": pending.verifier,
-                "scope": ENTRA_SCOPES,
-            }
-        )
+        tokens = await self._redeem_code(code, pending.verifier)
         claims = self._check_claims(id_token_claims(str(tokens.get("id_token", ""))))
         refresh = str(tokens.get("refresh_token", ""))
         if not refresh:
@@ -185,6 +185,54 @@ class EntraOAuthProvider(UserKeyOAuthProvider):
         self.store.upsert_user(user_id, label[:200], [(REFRESH_ENTRY, refresh)])
         _logger.info("User %s (%s) signed in with Microsoft", user_id, label)
         return self._grant_code(pending, user_id)
+
+    # Admin page sign-in ----------------------------------------------------
+
+    def is_admin_login(self, txn: str) -> bool:
+        """Whether a callback ``state`` belongs to an admin-page sign-in."""
+        return txn in self._admin_pending
+
+    def start_admin_login(self) -> str:
+        """Begin a Microsoft sign-in for the admin page; returns Entra's URL."""
+        now = time.time()
+        for txn in [t for t, (_v, exp) in self._admin_pending.items() if exp < now]:
+            del self._admin_pending[txn]
+        # Anyone can open /admin, so bound what unauthenticated visits can pile up.
+        while len(self._admin_pending) >= MAX_ADMIN_PENDING:
+            del self._admin_pending[next(iter(self._admin_pending))]
+        txn = secrets.token_urlsafe(32)
+        verifier = secrets.token_urlsafe(48)
+        self._admin_pending[txn] = (verifier, now + PENDING_LOGIN_TTL)
+        return self._entra_authorize_url(txn, verifier)
+
+    async def complete_admin_login(self, txn: str, code: str) -> dict[str, Any]:
+        """Redeem Entra's code for the admin page; returns the admin's ID token claims.
+
+        Raises:
+            AuthorizeError: The sign-in is unknown or expired.
+            EntraRejectedError: Not our tenant, or no admin app role.
+            EntraUnavailableError: Entra could not be reached or rejected our app.
+        """
+        verifier, expires_at = self._admin_pending.pop(txn, ("", 0.0))
+        if not verifier or expires_at < time.time() or not code:
+            raise AuthorizeError(error="invalid_request", error_description="Login expired")
+        tokens = await self._redeem_code(code, verifier)
+        claims = self._check_claims(id_token_claims(str(tokens.get("id_token", ""))))
+        roles = claims.get("roles") or []
+        if self.settings.entra_admin_role not in roles:
+            raise EntraRejectedError(f"no {self.settings.entra_admin_role} role")
+        return claims
+
+    async def _redeem_code(self, code: str, verifier: str) -> dict[str, Any]:
+        return await self._token_request(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": self.callback_url,
+                "code_verifier": verifier,
+                "scope": ENTRA_SCOPES,
+            }
+        )
 
     def _check_claims(self, claims: dict[str, Any]) -> dict[str, Any]:
         """Accept only an unexpired ID token issued by our tenant for our app."""
@@ -279,13 +327,24 @@ def _error_page(title: str, detail: str, status: int) -> HTMLResponse:
     return HTMLResponse(body, status_code=status, headers=_PAGE_HEADERS)
 
 
-def install_entra_routes(app: Any, provider: EntraOAuthProvider) -> None:
-    """Register the Entra redirect target on a FastMCP app (served without bearer auth)."""
+AdminLoginHandler = Callable[[dict[str, Any] | None, str], Awaitable[Response]]
+
+
+def install_entra_routes(
+    app: Any, provider: EntraOAuthProvider, on_admin_login: AdminLoginHandler | None = None
+) -> None:
+    """Register the Entra redirect target on a FastMCP app (served without bearer auth).
+
+    A callback for an admin-page sign-in is handed to ``on_admin_login`` with the
+    admin's claims, or None and a reason when the sign-in failed.
+    """
 
     @app.custom_route(CALLBACK_PATH, methods=["GET"])
     async def entra_callback(request: Request) -> Response:
         query = request.query_params
         txn = query.get("state", "")
+        if on_admin_login is not None and provider.is_admin_login(txn):
+            return await _admin_callback(provider, on_admin_login, txn, query)
         if query.get("error"):
             # The user cancelled, or Entra refused them (not assigned to the app,
             # blocked by conditional access). Its description says which.
@@ -315,3 +374,25 @@ def install_entra_routes(app: Any, provider: EntraOAuthProvider) -> None:
                 503,
             )
         return RedirectResponse(target, status_code=302, headers=_PAGE_HEADERS)
+
+
+async def _admin_callback(
+    provider: EntraOAuthProvider, handler: AdminLoginHandler, txn: str, query: Any
+) -> Response:
+    if query.get("error"):
+        provider._admin_pending.pop(txn, None)
+        return await handler(None, query.get("error_description", "") or query.get("error", ""))
+    try:
+        claims = await provider.complete_admin_login(txn, query.get("code", ""))
+    except AuthorizeError:
+        return await handler(None, "Deze aanmelding is verlopen.")
+    except EntraRejectedError as exc:
+        _logger.warning("Admin sign-in rejected: %s", exc)
+        return await handler(
+            None,
+            f"Je account heeft de rol {provider.settings.entra_admin_role} niet in Entra.",
+        )
+    except EntraUnavailableError as exc:
+        _logger.error("Admin sign-in failed: %s", exc)
+        return await handler(None, "Microsoft is momenteel niet bereikbaar.")
+    return await handler(claims, "")
