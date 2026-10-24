@@ -48,6 +48,7 @@ from mcp.shared.auth import OAuthClientInformationFull
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from . import ui
 from .config import MCPTransportSettings
 from .oauth_store import OAuthStore
 from .user_oauth import (
@@ -317,14 +318,12 @@ class AuditMiddleware(Middleware):
 
 
 def _error_page(title: str, detail: str, status: int) -> HTMLResponse:
-    body = (
-        '<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>UniFi koppelen</title>'
-        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
-        '<body style="font-family:system-ui,sans-serif;padding:16px;max-width:560px">'
-        f"<h1>{html.escape(title)}</h1><p>{html.escape(detail)}</p>"
-        "<p>Start het koppelen opnieuw vanuit Claude of Copilot.</p></body></html>"
+    return ui.message_page(
+        html.escape(title),
+        html.escape(detail),
+        "Start het koppelen opnieuw vanuit Claude of Copilot.",
+        status=status,
     )
-    return HTMLResponse(body, status_code=status, headers=_PAGE_HEADERS)
 
 
 AdminLoginHandler = Callable[[dict[str, Any] | None, str], Awaitable[Response]]
@@ -338,6 +337,7 @@ def install_entra_routes(
     A callback for an admin-page sign-in is handed to ``on_admin_login`` with the
     admin's claims, or None and a reason when the sign-in failed.
     """
+    ui.install_ui_routes(app)
 
     @app.custom_route(CALLBACK_PATH, methods=["GET"])
     async def entra_callback(request: Request) -> Response:
