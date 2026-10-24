@@ -25,6 +25,7 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from . import ui
 from .config import APIKeyConfig
 from .entra_oauth import EntraOAuthProvider, install_entra_routes
 from .oauth_store import OAuthStore
@@ -87,47 +88,11 @@ def _who(session: dict[str, str]) -> str:
 
 # Page -------------------------------------------------------------------------
 
-_STYLE = """
-  :root { color-scheme: light dark; --fg:#1f2328; --muted:#59636e; --bg:#f6f8fa; --card:#fff;
-          --line:#d1d9e0; --accent:#006fff; --err:#b42318; --ok:#1a7f37; }
-  @media (prefers-color-scheme: dark) {
-    :root { --fg:#e6edf3; --muted:#9198a1; --bg:#0d1117; --card:#161b22; --line:#30363d;
-            --accent:#4797ff; --err:#f97066; --ok:#3fb950; } }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:16px; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-         color:var(--fg); background:var(--bg); }
-  main { max-width:880px; margin:24px auto; }
-  section { background:var(--card); border:1px solid var(--line); border-radius:12px;
-            padding:20px; margin-bottom:16px; overflow-x:auto; }
-  h1 { font-size:1.4rem; margin:0 0 4px; } h2 { font-size:1.05rem; margin:0 0 12px; }
-  p { margin:0 0 12px; color:var(--muted); }
-  table { width:100%; border-collapse:collapse; font-size:.9rem; }
-  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line);
-           vertical-align:middle; }
-  th { color:var(--muted); font-weight:600; }
-  code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.85rem; }
-  form.inline { display:inline; }
-  label { display:block; font-weight:600; margin:12px 0 4px; }
-  input[type=text], input[type=password] { width:100%; padding:9px 11px; font:inherit;
-          color:inherit; background:transparent; border:1px solid var(--line); border-radius:8px; }
-  button { padding:7px 12px; font:inherit; font-weight:600; border-radius:8px; cursor:pointer;
-           border:1px solid var(--line); background:transparent; color:var(--fg); }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff;
-                   margin-top:16px; }
-  button.danger { color:var(--err); }
-  .msg { font-weight:600; } .msg.err { color:var(--err); } .msg.ok { color:var(--ok); }
-  .top { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
-"""
+_TITLE = "UniFi keys"
 
 
-def _page(body: str, status: int = 200) -> HTMLResponse:
-    doc = (
-        '<!doctype html><html lang="nl"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>UniFi keys beheren</title><style>{_STYLE}</style></head>"
-        f"<body><main>{body}</main></body></html>"
-    )
-    return HTMLResponse(doc, status_code=status, headers=_PAGE_HEADERS)
+def _page(body: str, status: int = 200, header: str = "") -> HTMLResponse:
+    return ui.page(_TITLE, body, status=status, layout="app", header=header)
 
 
 def _mask(key: str) -> str:
@@ -149,66 +114,70 @@ def _render(
     rows = []
     for cfg in env_keys():
         rows.append(
-            f"<tr><td>{e(cfg.label)}</td><td><code>{e(_mask(cfg.key))}</code></td>"
-            "<td>Stackvariabele <code>UNIFI_API_KEYS</code></td><td></td></tr>"
+            f'<tr><td>{e(cfg.label)}</td><td class="is-mono">{e(_mask(cfg.key))}</td>'
+            '<td class="is-muted">Stackvariabele <code>UNIFI_API_KEYS</code></td><td></td></tr>'
         )
     for k in store.list_fabric_keys():
         added = time.strftime("%d/%m/%Y %H:%M", time.localtime(k.added_at))
         rows.append(
-            f"<tr><td>{e(k.name)}</td><td><code>{e(_mask(k.api_key))}</code></td>"
-            f"<td>{e(k.added_by)}, {e(added)}</td><td>"
-            f'<form class="inline" method="post" action="{ADMIN_PATH}">'
+            f'<tr><td>{e(k.name)}</td><td class="is-mono">{e(_mask(k.api_key))}</td>'
+            f'<td class="is-muted">{e(k.added_by)}, {e(added)}</td><td class="is-actions">'
+            f'<form method="post" action="{ADMIN_PATH}">'
             f'<input type="hidden" name="csrf" value="{csrf}">'
             f'<input type="hidden" name="key_id" value="{e(k.key_id)}">'
-            '<button name="action" value="test">Testen</button> '
-            '<button class="danger" name="action" value="delete">Verwijderen</button>'
-            "</form></td></tr>"
+            '<button class="btn btn--sm" name="action" value="test">Testen</button>'
+            '<button class="btn btn--sm btn--danger" name="action" value="delete">'
+            "Verwijderen</button></form></td></tr>"
         )
     table = (
-        "<table><thead><tr><th>Naam</th><th>Key</th><th>Toegevoegd</th><th></th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table>"
+        '<div class="table-wrap"><table><thead><tr><th>Naam</th><th>Key</th>'
+        "<th>Toegevoegd</th><th></th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
         if rows
-        else "<p>Er zijn nog geen keys. Voeg hieronder de eerste toe.</p>"
+        else '<p class="empty">Er zijn nog geen keys. Voeg hieronder de eerste toe.</p>'
     )
-    notice = (
-        f'<p class="msg {"ok" if ok else "err"}" role="status">{e(message)}</p>' if message else ""
+    notice = ui.banner(e(message), "success" if ok else "danger") if message else ""
+    header = (
+        f'<span class="who">Aangemeld als {e(_who(session))}</span>'
+        f'<form method="post" action="{ADMIN_PATH}/logout">'
+        f'<input type="hidden" name="csrf" value="{csrf}">'
+        '<button class="btn btn--ghost">Afmelden</button></form>'
     )
     body = f"""
-<section>
-  <div class="top">
-    <div><h1>UniFi keys beheren</h1>
-    <p>Aangemeld als {e(_who(session))}. Iedereen die de UniFi-connector gebruikt, werkt met
-    deze keys: één per fabric, met de rechten van de key.</p></div>
-    <form method="post" action="{ADMIN_PATH}/logout">
-      <input type="hidden" name="csrf" value="{csrf}"><button>Afmelden</button></form>
-  </div>
-  {notice}
+{notice}
+<section class="panel" aria-labelledby="keys">
+  <div class="panel-head"><h2 class="panel-title" id="keys">Keys per fabric</h2></div>
+  <div class="panel-body"><p class="text">Iedereen die de UniFi-connector gebruikt, werkt met
+  deze keys: één per fabric, met de rechten van de key.</p></div>
   {table}
 </section>
-<section>
-  <h2>Key toevoegen</h2>
-  <p>Maak de key op unifi.ui.com: kies de fabric linksboven, open <em>API Keys</em> en kies
-  <em>Create API Key</em>. Hij wordt eerst getest en daarna versleuteld bewaard. Hij werkt
-  meteen, zonder herstart.</p>
-  <form method="post" action="{ADMIN_PATH}">
+<section class="panel" aria-labelledby="add">
+  <div class="panel-head"><h2 class="panel-title" id="add">Key toevoegen</h2></div>
+  <form class="panel-body" method="post" action="{ADMIN_PATH}">
+    <p class="text">Maak de key op unifi.ui.com: kies de fabric linksboven, open
+    <em>API Keys</em> en kies <em>Create API Key</em>. Hij wordt eerst getest en daarna
+    versleuteld bewaard. Hij werkt meteen, zonder herstart.</p>
     <input type="hidden" name="csrf" value="{csrf}">
-    <label for="name">Naam van de fabric</label>
-    <input id="name" name="name" type="text" required maxlength="{MAX_NAME_LENGTH}"
-           value="{e(name)}" placeholder="bv. VBC">
-    <label for="api_key">API key</label>
-    <input id="api_key" name="api_key" type="password" required autocomplete="off">
-    <button class="primary" name="action" value="add">Testen en toevoegen</button>
+    <div class="field"><label class="label" for="name">Naam van de fabric</label>
+    <input class="input" id="name" name="name" type="text" required
+           maxlength="{MAX_NAME_LENGTH}" value="{e(name)}" placeholder="bv. VBC"></div>
+    <div class="field"><label class="label" for="api_key">API key</label>
+    <input class="input" id="api_key" name="api_key" type="password" required
+           autocomplete="off"></div>
+    <div class="actions"><button class="btn btn--lg btn--primary" name="action"
+    value="add">Testen en toevoegen</button></div>
   </form>
 </section>"""
-    return _page(body, status)
+    return _page(body, status, header)
 
 
 def _denied(reason: str) -> HTMLResponse:
-    return _page(
-        "<section><h1>Geen toegang</h1>"
-        f"<p>{html.escape(reason)}</p>"
-        f'<p><a href="{ADMIN_PATH}">Opnieuw aanmelden</a></p></section>',
-        403,
+    return ui.message_page(
+        "Geen toegang",
+        html.escape(reason),
+        status=403,
+        link=f'<div class="actions"><a class="btn btn--lg btn--primary" '
+        f'href="{ADMIN_PATH}">Opnieuw aanmelden</a></div>',
     )
 
 

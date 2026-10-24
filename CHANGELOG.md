@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `list_traffic_flows` tool: reads a site's traffic flow log (Insights > Flows) with a time window (epoch seconds, default last hour), server-side `direction` / `action` / `risk` filters and paging (up to 5000 per page). The console only serves flows as a POST search; the tool is read-only, so it works without `UNIFI_ENABLE_CONNECTOR_WRITE`.
 
 ### Changed
+- The server's own web pages (the `user_key` login page, the Microsoft sign-in error pages and `/admin`) use the VBC Intern design system: its colour tokens in light and dark, Inter served by the server itself (`/ui/fonts/…`, Content-Security-Policy now allows `font-src 'self'`), the VBC logo, and its buttons, fields, table and notices. Nothing external is loaded and the pages still run no script.
 - With several API keys configured (one per Fabric), the fleet tools `list_all_devices`, `list_all_clients`, `get_fleet_summary`, `search_device_fleet` and `list_devices` (without `host`) now cover every key's org when no `key_label` is given, instead of only the first key. Records are tagged with `_keyLabel`, `get_fleet_summary` adds a per-key `byKey` breakdown, and a failing key is reported under `errors` without hiding the others. Passing `key_label` still scopes to one key.
 
 ### Fixed

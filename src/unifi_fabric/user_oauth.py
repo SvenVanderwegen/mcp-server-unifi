@@ -51,6 +51,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from . import ui
 from .config import MCPTransportSettings
 from .oauth_store import OAuthStore
 from .user_keys import (
@@ -606,77 +607,29 @@ class UserKeyMiddleware(Middleware):
 
 # Login page -----------------------------------------------------------------
 
-_PAGE_HEADERS = {
-    # The page takes a credential: never cache it, never let another site frame
-    # it (clickjacking the submit button), load nothing external. No
-    # form-action directive: browsers apply it to the redirect that follows the
-    # submit, which goes to the client's own domain.
-    "Cache-Control": "no-store",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
-    ),
-}
+_PAGE_HEADERS = ui.PAGE_HEADERS
 
-_PAGE = """<!doctype html>
-<html lang="nl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>UniFi koppelen</title>
-<style>
-  :root {{ color-scheme: light dark; --fg:#1f2328; --muted:#59636e; --bg:#f6f8fa; --card:#fff;
-          --line:#d1d9e0; --accent:#006fff; --err:#b42318; }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{ --fg:#e6edf3; --muted:#9198a1; --bg:#0d1117; --card:#161b22; --line:#30363d;
-            --accent:#4797ff; --err:#f97066; }} }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin:0; min-height:100vh; display:grid; place-items:center; padding:16px;
-         font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg);
-         background:var(--bg); }}
-  main {{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
-         border-radius:12px; padding:28px; }}
-  h1 {{ font-size:1.3rem; margin:0 0 4px; }}
-  p {{ margin:0 0 16px; color:var(--muted); }}
-  label {{ display:block; font-weight:600; margin:16px 0 6px; }}
-  input, textarea {{ width:100%; padding:10px 12px; font:inherit; color:inherit;
-          background:transparent; border:1px solid var(--line); border-radius:8px; }}
-  textarea {{ font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.85rem;
-             resize:vertical; -webkit-text-security:disc; }}
-  input:focus, textarea:focus {{ outline:2px solid var(--accent); outline-offset:1px; }}
-  .hint {{ font-size:.85rem; margin:6px 0 0; }}
-  .row {{ display:flex; gap:12px; margin-top:24px; }}
-  button {{ flex:1; padding:10px 12px; font:inherit; font-weight:600; border-radius:8px;
-           cursor:pointer; border:1px solid var(--accent); }}
-  .primary {{ background:var(--accent); color:#fff; }}
-  .secondary {{ background:transparent; color:var(--fg); border-color:var(--line); }}
-  .error {{ color:var(--err); font-weight:600; }}
-  .client {{ font-size:.9rem; }}
-  details {{ margin-top:16px; color:var(--muted); font-size:.9rem; }}
-</style>
-</head>
-<body>
-<main>
-  <h1>UniFi koppelen</h1>
-  <p class="client">{client}</p>
+_LOGIN_BODY = """<section class="panel" aria-labelledby="t"><div class="panel-body">
+  <div><h1 class="title" id="t">UniFi koppelen</h1>
+  <p class="lead">{client}</p></div>
   {message}
-  <form method="post" action="{action}">
+  <form method="post" action="{action}" class="stack">
     <input type="hidden" name="txn" value="{txn}">
-    <label for="name">Je naam</label>
-    <input id="name" name="name" type="text" autocomplete="name" required maxlength="100"
-           value="{name}">
-    <label for="api_key">Persoonlijke UniFi API key(s)</label>
-    <textarea id="api_key" name="api_key" rows="4" autocomplete="off" spellcheck="false"
-              required
+    <div class="field"><label class="label" for="name">Je naam</label>
+    <input class="input" id="name" name="name" type="text" autocomplete="name" required
+           maxlength="100" value="{name}"></div>
+    <div class="field"><label class="label" for="api_key">Persoonlijke UniFi API key(s)</label>
+    <textarea class="input" id="api_key" name="api_key" rows="4" autocomplete="off"
+              spellcheck="false" required
               placeholder="Eén key per regel, bv.&#10;VBC: abc123&#10;Klant X: def456"></textarea>
     <p class="hint">Werk je in meerdere fabrics? Een key ziet alleen de fabric waarin hij
     gemaakt is, dus zet één key per fabric op een eigen regel. De naam voor de dubbele
-    punt is optioneel.</p>
-    <div class="row">
-      <button class="secondary" type="submit" name="action" value="cancel"
+    punt is optioneel.</p></div>
+    <div class="actions">
+      <button class="btn btn--lg btn--ghost" type="submit" name="action" value="cancel"
               formnovalidate>Annuleren</button>
-      <button class="primary" type="submit" name="action" value="login">Koppelen</button>
+      <button class="btn btn--lg btn--primary" type="submit" name="action"
+              value="login">Koppelen</button>
     </div>
   </form>
   <details>
@@ -687,13 +640,17 @@ _PAGE = """<!doctype html>
     De assistent ziet dan precies de consoles die jouw UniFi-account ziet, en alles
     wat hij doet gebeurt met jouw rechten.
   </details>
-</main>
-</body>
-</html>
-"""
+</div></section>"""
 
 
-def _render(provider: UserKeyOAuthProvider, txn: str, *, message: str = "", name: str = "") -> str:
+def _render(
+    provider: UserKeyOAuthProvider,
+    txn: str,
+    *,
+    message: str = "",
+    name: str = "",
+    status: int = 200,
+) -> HTMLResponse:
     pending = provider.pending_login(txn)
     client = ""
     if pending is not None:
@@ -703,24 +660,22 @@ def _render(provider: UserKeyOAuthProvider, txn: str, *, message: str = "", name
             f"{html.escape(app)} vraagt toegang tot UniFi en stuurt je daarna terug naar "
             f"<strong>{html.escape(target)}</strong>."
         )
-    return _PAGE.format(
+    body = _LOGIN_BODY.format(
         client=client,
-        message=f'<p class="error" role="alert">{html.escape(message)}</p>' if message else "",
+        message=ui.banner(html.escape(message), "danger") if message else "",
         action=html.escape(LOGIN_PATH),
         txn=html.escape(txn),
         name=html.escape(name),
     )
+    return ui.page("UniFi koppelen", body, status=status)
 
 
 def _expired_page() -> HTMLResponse:
-    body = (
-        '<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>UniFi koppelen</title>'
-        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
-        '<body style="font-family:system-ui,sans-serif;padding:16px">'
-        "<h1>Deze aanmelding is verlopen</h1>"
-        "<p>Start het koppelen opnieuw vanuit Claude of Copilot.</p></body></html>"
+    return ui.message_page(
+        "Deze aanmelding is verlopen",
+        "Start het koppelen opnieuw vanuit Claude of Copilot.",
+        status=400,
     )
-    return HTMLResponse(body, status_code=400, headers=_PAGE_HEADERS)
 
 
 def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
@@ -729,13 +684,14 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
     Custom routes are served without bearer authentication, which is the point:
     the user has no token yet.
     """
+    ui.install_ui_routes(app)
 
     @app.custom_route(LOGIN_PATH, methods=["GET"])
     async def login_form(request: Request) -> Response:
         txn = request.query_params.get("txn", "")
         if provider.pending_login(txn) is None:
             return _expired_page()
-        return HTMLResponse(_render(provider, txn), headers=_PAGE_HEADERS)
+        return _render(provider, txn)
 
     @app.custom_route(LOGIN_PATH, methods=["POST"])
     async def login_submit(request: Request) -> Response:
@@ -745,15 +701,12 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
         try:
             keys = parse_keys(str(form.get("api_key", "")))
         except ValueError:
-            return HTMLResponse(
-                _render(
-                    provider,
-                    txn,
-                    message=f"Je kan maximaal {MAX_KEYS_PER_USER} keys tegelijk koppelen.",
-                    name=name,
-                ),
-                status_code=400,
-                headers=_PAGE_HEADERS,
+            return _render(
+                provider,
+                txn,
+                message=f"Je kan maximaal {MAX_KEYS_PER_USER} keys tegelijk koppelen.",
+                name=name,
+                status=400,
             )
 
         if form.get("action") == "cancel":
@@ -765,10 +718,8 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
         if provider.pending_login(txn) is None:
             return _expired_page()
         if not name or not keys:
-            return HTMLResponse(
-                _render(provider, txn, message="Vul je naam en API key in.", name=name),
-                status_code=400,
-                headers=_PAGE_HEADERS,
+            return _render(
+                provider, txn, message="Vul je naam en API key in.", name=name, status=400
             )
         try:
             target, _hosts = await provider.complete_login(txn, name, keys)
@@ -781,23 +732,16 @@ def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
                 if which
                 else "UniFi aanvaardt deze API key niet. Controleer hem en probeer opnieuw."
             )
-            return HTMLResponse(
-                _render(provider, txn, message=message, name=name),
-                status_code=401,
-                headers=_PAGE_HEADERS,
-            )
+            return _render(provider, txn, message=message, name=name, status=401)
         except AuthorizeError:
             return _expired_page()
         except UniFiUnreachableError as exc:
             _logger.error("Site Manager API unreachable during login: %s", exc)
-            return HTMLResponse(
-                _render(
-                    provider,
-                    txn,
-                    message="UniFi is momenteel niet bereikbaar. Probeer het straks opnieuw.",
-                    name=name,
-                ),
-                status_code=503,
-                headers=_PAGE_HEADERS,
+            return _render(
+                provider,
+                txn,
+                message="UniFi is momenteel niet bereikbaar. Probeer het straks opnieuw.",
+                name=name,
+                status=503,
             )
         return RedirectResponse(target, status_code=302, headers=_PAGE_HEADERS)
