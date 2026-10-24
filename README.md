@@ -11,7 +11,9 @@
 > in with their own UniFi Site Manager API key, and every tool call runs on that
 > key. Works with Claude and Microsoft 365 Copilot. See
 > [docs/per-user-deployment.md](docs/per-user-deployment.md) and
-> `docker-compose.yml`. Everything else tracks upstream
+> `docker-compose.yml`. Or `MCP_AUTH_MODE=entra`: people sign in with Microsoft
+> 365 and share the server's own key per Fabric, see
+> [docs/entra-deployment.md](docs/entra-deployment.md). Everything else tracks upstream
 > [swkstudios/unifi-fabric-mcp-server](https://github.com/swkstudios/unifi-fabric-mcp-server).
 
 > **Cloud-first UniFi management for AI agents.** This server connects to the official UniFi Site Manager / Fabric cloud API (`api.ui.com`) — no direct controller access, SSH, or local network access required. Manage your entire UniFi fleet from anywhere through natural language.

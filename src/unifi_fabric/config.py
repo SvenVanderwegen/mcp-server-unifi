@@ -96,10 +96,10 @@ class MCPTransportSettings(BaseSettings):
     )
 
     # --- Auth selector -------------------------------------------------------
-    auth_mode: Literal["none", "bearer", "oauth", "user_key"] | None = Field(
+    auth_mode: Literal["none", "bearer", "oauth", "user_key", "entra"] | None = Field(
         default=None,
         description="Auth mode selector (MCP_AUTH_MODE): one of 'none', 'bearer', 'oauth', "
-        "'user_key'. Unset resolves from bearer_token for backward compatibility.",
+        "'user_key', 'entra'. Unset resolves from bearer_token for backward compatibility.",
     )
     oauth_issuer: str = Field(
         default="",
@@ -135,20 +135,22 @@ class MCPTransportSettings(BaseSettings):
         "(MCP_OAUTH_AUTHORIZATION_SERVERS). Defaults to [oauth_issuer] when unset.",
     )
 
-    # --- Per-user key mode (auth_mode='user_key') ---------------------------
-    # The server is its own OAuth authorization server. Each person logs in on
-    # its /oauth/login page with their own UniFi Site Manager API key, and every
-    # call made with the resulting token uses that key. See user_oauth.py.
+    # --- Own OAuth server (auth_mode='user_key' or 'entra') ------------------
+    # The server is its own OAuth authorization server. In 'user_key' mode each
+    # person logs in on its /oauth/login page with their own UniFi Site Manager
+    # API key, and every call made with the resulting token uses that key (see
+    # user_oauth.py). In 'entra' mode each person signs in with Microsoft and
+    # every call uses the server's own UNIFI_API_KEYS (see entra_oauth.py).
     public_url: str = Field(
         default="",
         description="Public https:// base URL clients reach this server at, without the "
-        "/mcp path (MCP_PUBLIC_URL). Required when auth_mode='user_key'.",
+        "/mcp path (MCP_PUBLIC_URL). Required when auth_mode is 'user_key' or 'entra'.",
     )
     secret_key: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
-        description="Secret(s) that encrypt the stored UniFi API keys (MCP_SECRET_KEY), "
+        description="Secret(s) that encrypt the stored user credentials (MCP_SECRET_KEY), "
         "comma-separated for rotation: the first encrypts, all decrypt. Required when "
-        "auth_mode='user_key'; at least 32 characters each.",
+        "auth_mode is 'user_key' or 'entra'; at least 32 characters each.",
     )
     oauth_db_path: str = Field(
         default="unifi-mcp-oauth.sqlite3",
@@ -178,6 +180,22 @@ class MCPTransportSettings(BaseSettings):
     oauth_client_redirect_uris: Annotated[list[str], NoDecode] = Field(default_factory=list)
     oauth_client_auth_method: Literal["client_secret_post", "client_secret_basic"] = Field(
         default="client_secret_post"
+    )
+
+    # --- Microsoft sign-in (auth_mode='entra') -------------------------------
+    entra_tenant_id: str = Field(
+        default="",
+        description="Directory (tenant) ID of the Microsoft Entra tenant whose users may "
+        "sign in (MCP_ENTRA_TENANT_ID). Must be a tenant GUID: 'common', 'organizations' "
+        "and 'consumers' would let any Microsoft account in.",
+    )
+    entra_client_id: str = Field(
+        default="",
+        description="Application (client) ID of the Entra app registration (MCP_ENTRA_CLIENT_ID).",
+    )
+    entra_client_secret: str = Field(
+        default="",
+        description="Client secret of the Entra app registration (MCP_ENTRA_CLIENT_SECRET).",
     )
 
     # --- TLS selector --------------------------------------------------------
@@ -233,7 +251,7 @@ class MCPTransportSettings(BaseSettings):
     def _validate_auth_mode(cls, v: object) -> object:
         if v is None or v == "":
             return None
-        valid = ("none", "bearer", "oauth", "user_key")
+        valid = ("none", "bearer", "oauth", "user_key", "entra")
         if v not in valid:
             raise ValueError(f"MCP_AUTH_MODE must be one of {', '.join(valid)} (got {v!r})")
         return v
@@ -292,8 +310,10 @@ class MCPTransportSettings(BaseSettings):
             if not self.oauth_authorization_servers:
                 self.oauth_authorization_servers = [self.oauth_issuer]
 
-        if self.auth_mode == "user_key":
+        if self.auth_mode in ("user_key", "entra"):
             self._validate_user_key_mode()
+        if self.auth_mode == "entra":
+            self._validate_entra_mode()
 
         # HTTPS/mTLS require a server cert + key; mTLS additionally a client CA.
         if self.tls_mode in ("https", "mtls"):
@@ -340,12 +360,13 @@ class MCPTransportSettings(BaseSettings):
         return self
 
     def _validate_user_key_mode(self) -> None:
-        """Fail closed on an incomplete per-user key configuration."""
+        """Fail closed on an incomplete own-OAuth-server configuration."""
         from urllib.parse import urlparse
 
+        mode = self.auth_mode
         if not self.public_url:
             raise ValueError(
-                "auth_mode='user_key' requires MCP_PUBLIC_URL, the https:// URL clients "
+                f"auth_mode={mode!r} requires MCP_PUBLIC_URL, the https:// URL clients "
                 "reach this server at (without /mcp)"
             )
         parsed = urlparse(self.public_url)
@@ -357,8 +378,8 @@ class MCPTransportSettings(BaseSettings):
         self.public_url = self.public_url.rstrip("/")
         if not self.secret_key:
             raise ValueError(
-                "auth_mode='user_key' requires MCP_SECRET_KEY, used to encrypt the stored "
-                "UniFi API keys (generate one with: openssl rand -hex 32)"
+                f"auth_mode={mode!r} requires MCP_SECRET_KEY, used to encrypt the stored "
+                "user credentials (generate one with: openssl rand -hex 32)"
             )
         if any(len(k) < MIN_SECRET_LENGTH for k in self.secret_key):
             raise ValueError(f"MCP_SECRET_KEY must be at least {MIN_SECRET_LENGTH} characters")
@@ -372,6 +393,34 @@ class MCPTransportSettings(BaseSettings):
             raise ValueError(
                 f"MCP_OAUTH_CLIENT_SECRET must be at least {MIN_SECRET_LENGTH} characters"
             )
+
+    def _validate_entra_mode(self) -> None:
+        """Fail closed on an incomplete or tenant-less Microsoft sign-in configuration."""
+        import uuid
+
+        required = {
+            "MCP_ENTRA_TENANT_ID": self.entra_tenant_id,
+            "MCP_ENTRA_CLIENT_ID": self.entra_client_id,
+            "MCP_ENTRA_CLIENT_SECRET": self.entra_client_secret,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError("auth_mode='entra' requires " + ", ".join(missing))
+        # Every signed-in user runs on the server's own UniFi keys, so the tenant
+        # is the access boundary: a multi-tenant authority would hand those keys
+        # to any Microsoft account.
+        try:
+            uuid.UUID(self.entra_tenant_id)
+        except ValueError:
+            raise ValueError(
+                "MCP_ENTRA_TENANT_ID must be your tenant's directory ID (a GUID), not "
+                f"{self.entra_tenant_id!r}"
+            ) from None
+
+    @property
+    def entra_mode(self) -> bool:
+        """Whether users sign in with Microsoft and share the server's UniFi keys."""
+        return self.auth_mode == "entra"
 
     @property
     def user_key_mode(self) -> bool:

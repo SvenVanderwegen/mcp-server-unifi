@@ -1,5 +1,8 @@
-# Remote UniFi MCP server with per-user keys, behind an existing Traefik on the
-# `proxy` network. Every person logs in with their own UniFi Site Manager API key.
+# Remote UniFi MCP server behind an existing Traefik on the `proxy` network.
+# MCP_AUTH_MODE picks how people log in:
+#   user_key (default) - everyone pastes their own UniFi API key(s)
+#   entra              - everyone signs in with Microsoft 365 and the server uses
+#                        its own UNIFI_API_KEYS (see docs/entra-deployment.md)
 #
 # Deploy:  docker compose up -d --build
 # Config:  cp .env.example stack.env   (Portainer writes stack.env for you)
@@ -23,9 +26,9 @@ services:
       FASTMCP_TRANSPORT: streamable-http
       FASTMCP_HOST: 0.0.0.0
       FASTMCP_PORT: 3000
-      MCP_AUTH_MODE: user_key
-      # Each person may do whatever their own UniFi account allows, so the
-      # guarded generic connector relay is on too (each mutation still needs
+      MCP_AUTH_MODE: ${MCP_AUTH_MODE:-user_key}
+      # People may do whatever the UniFi key they run on allows, so the guarded
+      # generic connector relay is on too (each mutation still needs
       # confirm=true). Mobility and Carrier writes stay at upstream's default.
       UNIFI_ENABLE_CONNECTOR_WRITE: "true"
       # Survives rebuilds, so nobody has to paste their key again after a deploy.

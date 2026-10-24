@@ -357,7 +357,10 @@ class UserKeyOAuthProvider(OAuthProvider):
             len(keys),
             hosts,
         )
+        return self._grant_code(pending, user_id), hosts
 
+    def _grant_code(self, pending: _PendingLogin, user_id: str) -> str:
+        """Issue the authorization code for a finished login; returns the client redirect."""
         code = secrets.token_urlsafe(32)
         params = pending.params
         self._codes[code] = UserAuthorizationCode(
@@ -371,8 +374,7 @@ class UserKeyOAuthProvider(OAuthProvider):
             resource=params.resource,
             user_id=user_id,
         )
-        target = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
-        return target, hosts
+        return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
 
     def abandon_login(self, txn: str) -> str | None:
         """Cancel a pending login; returns the client redirect carrying the error."""
