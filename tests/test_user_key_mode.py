@@ -485,3 +485,95 @@ async def test_preregistered_client_for_copilot(user_key_app, auth_method):
             assert token.status_code == 200, token.text
             rpc = await _call_tool(client, token.json()["access_token"], "list_hosts", {})
         assert "Bob-Branch" in _tool_text(rpc)
+
+
+# ---------------------------------------------------------------------------
+# Several Fabrics: one key per Fabric, one login
+# ---------------------------------------------------------------------------
+
+
+def _host_response(request: httpx.Request) -> httpx.Response:
+    key = request.headers.get("X-API-KEY", "")
+    host_id = request.url.path.rsplit("/", 1)[-1]
+    for host in _HOSTS.get(key, []):
+        if host["id"] == host_id:
+            return httpx.Response(200, json={"data": host})
+    return httpx.Response(403, json={"message": "forbidden: host not found"})
+
+
+def test_parse_keys():
+    from unifi_fabric.user_oauth import MAX_KEYS_PER_USER, parse_keys
+
+    text = "VBC: key-one\n\n  key-two  \nKlant X = key-three\nkey-one\n"
+    assert parse_keys(text) == [
+        ("VBC", "key-one"),
+        ("fabric2", "key-two"),
+        ("Klant X", "key-three"),
+    ]
+    assert parse_keys("single-key") == [("fabric1", "single-key")]
+    with pytest.raises(ValueError):
+        parse_keys("\n".join(f"k{i}" for i in range(MAX_KEYS_PER_USER + 1)))
+
+
+def test_key_labels_are_unique_per_key_not_per_name():
+    from unifi_fabric.user_keys import key_configs_for
+
+    a, b = key_configs_for([("VBC", "key-a"), ("VBC", "key-b")])
+    assert a.label != b.label
+    assert a.label.startswith("VBC-") and b.label.startswith("VBC-")
+
+
+def test_store_reads_rows_written_with_a_single_key(tmp_path):
+    store = OAuthStore(str(tmp_path / "s.sqlite3"), [_SECRET])
+    # A row as the first release wrote it: the bare key, encrypted.
+    encrypted = store._fernet.encrypt(_KEY_ALICE.encode()).decode()
+    store._db.execute(
+        "INSERT INTO users (user_id, name, api_key, validated_at, updated_at) "
+        "VALUES ('old', 'Alice', ?, 0, 0)",
+        (encrypted,),
+    )
+    user = store.get_user("old")
+    assert user is not None
+    assert user.keys == (("fabric", _KEY_ALICE),)
+
+
+@pytest.mark.asyncio
+async def test_one_login_with_a_key_per_fabric(user_key_app):
+    async with user_key_app() as (_srv, client):
+        with respx.mock(assert_all_called=False) as mock:
+            hosts_route = mock.get(f"{_API}/v1/hosts").mock(side_effect=_hosts_response)
+            mock.get(url__regex=rf"{_API}/v1/hosts/.+").mock(side_effect=_host_response)
+            token = await _login(client, f"Fabric A: {_KEY_ALICE}\nFabric B: {_KEY_BOB}")
+
+            hosts = _tool_text(await _call_tool(client, token["access_token"], "list_hosts", {}))
+            bob_host = _tool_text(
+                await _call_tool(client, token["access_token"], "get_host", {"host": "Bob-Branch"})
+            )
+
+        # Both Fabrics' consoles in one list, each tagged with its key's label.
+        assert "Alice-HQ" in hosts and "Bob-Branch" in hosts
+        assert "Fabric-A-" in hosts and "Fabric-B-" in hosts
+        # A per-console call rides the key of the Fabric that owns the console.
+        assert "console-bob" in bob_host
+        used = {c.request.headers["X-API-KEY"] for c in hosts_route.calls}
+        assert used == {_KEY_ALICE, _KEY_BOB}
+
+
+@pytest.mark.asyncio
+async def test_login_names_the_refused_fabric_key(user_key_app):
+    async with user_key_app() as (_srv, client):
+        with respx.mock(assert_all_called=False) as mock:
+            mock.get(f"{_API}/v1/hosts").mock(side_effect=_hosts_response)
+            reg = (await _register(client)).json()
+            login_path, _ = await _start_login(client, reg["client_id"])
+            resp = await client.post(
+                "/oauth/login",
+                data={
+                    "txn": _txn(login_path),
+                    "name": "X",
+                    "api_key": f"Goed: {_KEY_ALICE}\nFout: not-a-real-key",
+                    "action": "login",
+                },
+            )
+        assert resp.status_code == 401
+        assert "Fout" in resp.text and "Goed" not in resp.text.split("niet:")[1].split(".")[0]

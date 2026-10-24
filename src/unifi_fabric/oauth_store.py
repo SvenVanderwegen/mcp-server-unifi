@@ -3,7 +3,7 @@
 One SQLite file holds everything that must survive a restart:
 
 - registered OAuth clients (dynamic client registration),
-- each user's UniFi Site Manager API key, encrypted at rest,
+- each user's UniFi Site Manager API keys (one per Fabric), encrypted at rest,
 - issued access and refresh tokens.
 
 Tokens are stored as SHA-256 digests, never in the clear: a copy of the file
@@ -74,12 +74,35 @@ def _fernet_for(secret: str) -> Fernet:
 
 @dataclass(frozen=True)
 class StoredUser:
-    """A user's UniFi key as stored after a successful login."""
+    """A user's UniFi keys as stored after a successful login.
+
+    ``keys`` holds one (name, key) pair per UniFi Fabric the user linked.
+    """
 
     user_id: str
     name: str
-    api_key: str
+    keys: tuple[tuple[str, str], ...]
     validated_at: float
+
+    @property
+    def api_key(self) -> str:
+        """The first (default) key."""
+        return self.keys[0][1]
+
+
+def _encode_keys(keys: list[tuple[str, str]]) -> str:
+    return json.dumps([{"name": name, "key": key} for name, key in keys])
+
+
+def _decode_keys(plaintext: str) -> tuple[tuple[str, str], ...]:
+    # Rows written before multi-Fabric support hold a bare key, not JSON.
+    try:
+        data = json.loads(plaintext)
+    except ValueError:
+        return (("fabric", plaintext),)
+    if not isinstance(data, list):
+        return (("fabric", plaintext),)
+    return tuple((str(item["name"]), str(item["key"])) for item in data)
 
 
 @dataclass(frozen=True)
@@ -143,9 +166,14 @@ class OAuthStore:
 
     # Users ------------------------------------------------------------------
 
-    def upsert_user(self, user_id: str, name: str, api_key: str) -> None:
-        """Store (or replace) a user's display name and encrypted API key."""
-        encrypted = self._fernet.encrypt(api_key.encode("utf-8")).decode("ascii")
+    def upsert_user(self, user_id: str, name: str, keys: list[tuple[str, str]] | str) -> None:
+        """Store (or replace) a user's display name and encrypted API keys.
+
+        ``keys`` is a list of (name, key) pairs, one per Fabric, or a single key.
+        """
+        if isinstance(keys, str):
+            keys = [("fabric", keys)]
+        encrypted = self._fernet.encrypt(_encode_keys(keys).encode("utf-8")).decode("ascii")
         now = time.time()
         with self._lock:
             self._db.execute(
@@ -171,7 +199,7 @@ class OAuthStore:
         if row is None:
             return None
         try:
-            api_key = self._fernet.decrypt(row[2].encode("ascii")).decode("utf-8")
+            plaintext = self._fernet.decrypt(row[2].encode("ascii")).decode("utf-8")
         except InvalidToken:
             _logger.warning(
                 "Stored API key for user %s cannot be decrypted with the configured "
@@ -179,7 +207,9 @@ class OAuthStore:
                 user_id,
             )
             return None
-        return StoredUser(user_id=row[0], name=row[1], api_key=api_key, validated_at=row[3])
+        return StoredUser(
+            user_id=row[0], name=row[1], keys=_decode_keys(plaintext), validated_at=row[3]
+        )
 
     def mark_validated(self, user_id: str, when: float | None = None) -> None:
         """Record that the user's key was just accepted by the Site Manager API."""

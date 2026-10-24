@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `MCP_AUTH_MODE=user_key` (fork): the server acts as its own OAuth 2.1 authorization server with a login page (`/oauth/login`) where each person enters their own UniFi Site Manager API key. Keys are validated against `/v1/hosts`, stored Fernet-encrypted in SQLite (`MCP_OAUTH_DB_PATH`), re-checked every `MCP_OAUTH_REVALIDATE_INTERVAL` seconds, and every MCP request runs on the caller's key only. Supports dynamic client registration (Claude) and a pre-registered client (Microsoft 365 Copilot). New settings: `MCP_PUBLIC_URL`, `MCP_SECRET_KEY`, `MCP_OAUTH_*`.
+- Per-user mode accepts one UniFi API key per Fabric in a single login (one key per line on the login page, optionally `Name: key`). A Site Manager key only sees the Fabric it was created in; with several keys, `list_hosts` / `list_sites` aggregate across all of them and per-console tools route to the key that owns the console. Every key must be accepted at login and on revalidation.
 - Unauthenticated `GET /health` liveness route.
 - `docker-compose.yml` and `.env.example` for a Traefik/Portainer deployment of the per-user mode, with a `/data` volume.
 
