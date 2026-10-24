@@ -32,7 +32,7 @@ from ..client import (
     validate_id,
 )
 from ..config import APIKeyConfig
-from ..registry import Registry, _assert_uuid
+from ..registry import Registry, _assert_uuid, _norm_mac, _norm_name
 from ._pagination import collect_cursor, mark_incomplete
 from .network import _proxy
 
@@ -142,6 +142,70 @@ async def list_hosts(
     if collected["nextToken"]:
         result["nextToken"] = collected["nextToken"]
     return mark_incomplete(result, collected)
+
+
+def _host_row(host: dict[str, Any]) -> dict[str, Any]:
+    """One line of the ``find_hosts`` index: what identifies a console, nothing more."""
+    reported = host.get("reportedState") or {}
+    hardware = reported.get("hardware") or {}
+    row = {
+        "id": host.get("id"),
+        "name": reported.get("name") or host.get("name"),
+        "hostname": reported.get("hostname"),
+        "mac": hardware.get("mac") or reported.get("mac"),
+        "model": hardware.get("shortname") or hardware.get("name"),
+        "firmware": reported.get("version") or hardware.get("firmwareVersion"),
+        "state": reported.get("state"),
+        "ipAddress": host.get("ipAddress"),
+        "type": host.get("type"),
+    }
+    if "_keyLabel" in host:
+        row["_keyLabel"] = host["_keyLabel"]
+    return row
+
+
+def _host_row_matches(row: dict[str, Any], query: str) -> bool:
+    needle = _norm_name(query)
+    texts = [row.get(k) for k in ("id", "name", "hostname", "model", "ipAddress")]
+    if any(isinstance(t, str) and needle in _norm_name(t) for t in texts):
+        return True
+    mac = _norm_mac(query)
+    row_mac = row.get("mac")
+    return bool(mac) and isinstance(row_mac, str) and _norm_mac(row_mac) == mac
+
+
+async def find_hosts(
+    client: UniFiClient,
+    registry: Registry,
+    *,
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Compact index of every console: id, name, hostname, MAC, model, firmware, state.
+
+    Meant for finding a console's exact name or id among many (MSP setups have
+    hundreds), where the full ``list_hosts`` records are too large to read in one
+    response. It is an index, not a replacement: ``get_host`` returns the complete
+    record of one console, ``list_hosts`` all of them. ``query`` keeps only consoles
+    whose name, hostname, id, model or IP contains it (case- and
+    whitespace-insensitive), or whose MAC equals it in any notation. With several
+    API keys every key's consoles are included, tagged with ``_keyLabel``.
+    """
+    labels = client.list_key_labels()
+    errors: list[str] = []
+    if len(labels) > 1:
+        hosts, errors = await _aggregate_lists_over_keys(
+            client, labels, lambda key: registry.get_hosts(key=key)
+        )
+    else:
+        hosts = await registry.get_hosts()
+    rows = [_host_row(h) for h in hosts]
+    if query and query.strip():
+        rows = [r for r in rows if _host_row_matches(r, query)]
+    rows.sort(key=lambda r: str(r.get("name") or r.get("id") or "").casefold())
+    result: dict[str, Any] = {"hosts": rows, "count": len(rows)}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 async def get_host(
