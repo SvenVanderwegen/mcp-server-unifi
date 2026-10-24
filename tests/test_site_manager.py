@@ -1095,3 +1095,18 @@ class TestNamespaceURLPinning:
         for family in ("hosts", "sites", "devices", "isp-metrics", "sd-wan-configs"):
             assert (ea + family + '"') not in src
             assert (ea + family + "/") not in src
+
+
+async def test_list_devices_without_host_covers_every_key(multikey_client, multikey_registry):
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from unifi_fabric.tools.site_manager import list_devices as _list_devices
+
+    async def by_key(path, key=None, **kwargs):
+        return [{"hostId": f"console-{key.label}-1", "devices": []}]
+
+    multikey_client.paginate = _AsyncMock(side_effect=by_key)
+    result = await _list_devices(multikey_client, multikey_registry)
+    assert result["count"] == 2
+    assert {d["_keyLabel"] for d in result["devices"]} == {"alpha", "beta"}
+    assert result["key_labels"] == ["alpha", "beta"]

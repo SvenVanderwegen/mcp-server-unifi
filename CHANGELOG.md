@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MCP_AUTH_MODE=entra` (fork): people sign in with their Microsoft 365 (Entra ID) account instead of pasting UniFi keys, and every call runs on the server's own `UNIFI_API_KEYS` (one per Fabric). Only users of the configured tenant (`MCP_ENTRA_TENANT_ID`, a GUID) for the configured app are accepted; their Entra refresh token is re-redeemed every `MCP_OAUTH_REVALIDATE_INTERVAL` seconds so disabled accounts lose access; every tool call is logged with the user's name. New settings: `MCP_ENTRA_TENANT_ID`, `MCP_ENTRA_CLIENT_ID`, `MCP_ENTRA_CLIENT_SECRET`. `docker-compose.yml` now reads `MCP_AUTH_MODE` from the stack environment (default `user_key`).
 - `/admin` page in `MCP_AUTH_MODE=entra` (fork): admins sign in with Microsoft and need the Entra app role `MCP_ENTRA_ADMIN_ROLE` (default `UniFi.Admin`). They can add a Fabric key (tested against `/v1/hosts` first, stored encrypted), test it or remove it, and the change applies on the next request without a redeploy. These keys are used alongside `UNIFI_API_KEYS`, and the server now starts in this mode without any configured key.
 - Unauthenticated `GET /health` liveness route.
+
+### Changed
+- With several API keys configured (one per Fabric), the fleet tools `list_all_devices`, `list_all_clients`, `get_fleet_summary`, `search_device_fleet` and `list_devices` (without `host`) now cover every key's org when no `key_label` is given, instead of only the first key. Records are tagged with `_keyLabel`, `get_fleet_summary` adds a per-key `byKey` breakdown, and a failing key is reported under `errors` without hiding the others. Passing `key_label` still scopes to one key.
 - `docker-compose.yml` and `.env.example` for a Traefik/Portainer deployment of the per-user mode, with a `/data` volume.
 
 ## [0.6.2] - 2026-08-16

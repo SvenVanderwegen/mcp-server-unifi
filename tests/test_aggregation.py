@@ -647,3 +647,115 @@ class TestNamespaceURLPinningAggregation:
         path = client.paginate.call_args.args[0]
         assert path == "/v1/devices"
         assert not path.startswith("/ea/")
+
+
+# ---------------------------------------------------------------------------
+# Multi-key: fleet tools cover every key's org when no key_label is given
+# ---------------------------------------------------------------------------
+
+_DEVICES_BY_KEY = {
+    "k-alpha": [
+        {"hostId": "console-alpha-1", "devices": [{"name": "ap-alpha", "status": "online"}]}
+    ],
+    "k-beta": [
+        {
+            "hostId": "console-beta-1",
+            "devices": [
+                {"name": "sw-beta", "status": "offline", "productLine": "network"},
+                {"name": "cam-beta", "status": "online", "productLine": "protect"},
+            ],
+        }
+    ],
+}
+
+
+def _paginate_by_key(path, key=None, **kwargs):
+    assert key is not None, "multi-key fleet queries must name the key for every call"
+    if path == "/v1/devices":
+        return _DEVICES_BY_KEY[key.key]
+    if path == "/v1/hosts":
+        return [{"id": f"console-{key.label}-1"}]
+    if path == "/v1/sites":
+        return [{"siteId": f"site-{key.label}-{i}"} for i in range(2 if key.label == "beta" else 1)]
+    raise AssertionError(path)
+
+
+class TestFleetToolsOverAllKeys:
+    async def test_list_all_devices_covers_every_key(self, multikey_client):
+        multikey_client.paginate = AsyncMock(side_effect=_paginate_by_key)
+        result = await _list_all_devices_fleet(multikey_client)
+        assert {w["_keyLabel"] for w in result["devices"]} == {"alpha", "beta"}
+        assert result["key_labels"] == ["alpha", "beta"]
+        assert "errors" not in result
+
+    async def test_key_label_still_scopes_to_one_key(self, multikey_client):
+        multikey_client.paginate = AsyncMock(side_effect=_paginate_by_key)
+        result = await _list_all_devices_fleet(multikey_client, key_label="beta")
+        assert [w["hostId"] for w in result["devices"]] == ["console-beta-1"]
+        assert "key_labels" not in result
+
+    async def test_fleet_summary_totals_and_per_key_breakdown(
+        self, multikey_client, multikey_registry
+    ):
+        multikey_client.paginate = AsyncMock(side_effect=_paginate_by_key)
+        result = await _fleet_summary(multikey_client, multikey_registry)
+        assert result["hosts"] == 2
+        assert result["sites"] == 3
+        assert result["devices"]["total"] == 3
+        assert result["devices"]["byStatus"] == {"online": 2, "offline": 1}
+        assert result["byKey"] == {
+            "alpha": {"hosts": 1, "sites": 1, "devices": 1},
+            "beta": {"hosts": 1, "sites": 2, "devices": 2},
+        }
+
+    async def test_fleet_summary_reports_a_failing_key(self, multikey_client, multikey_registry):
+        def flaky(path, key=None, **kwargs):
+            if key.label == "beta":
+                raise UniFiConnectionError("beta down")
+            return _paginate_by_key(path, key=key)
+
+        multikey_client.paginate = AsyncMock(side_effect=flaky)
+        result = await _fleet_summary(multikey_client, multikey_registry)
+        assert result["hosts"] == 1
+        assert result["errors"] and result["errors"][0].startswith("beta:")
+        multikey_client.paginate = AsyncMock(side_effect=UniFiConnectionError("all down"))
+        with pytest.raises(RuntimeError, match="All 2 API key"):
+            await _fleet_summary(multikey_client, multikey_registry)
+
+    async def test_search_finds_a_device_behind_the_second_key(self, multikey_client):
+        multikey_client.paginate = AsyncMock(side_effect=_paginate_by_key)
+        result = await _search_device(multikey_client, "sw-beta")
+        assert result["count"] == 1
+        assert result["matches"][0]["_keyLabel"] == "beta"
+
+    async def test_list_all_clients_uses_each_sites_own_key(
+        self, multikey_client, multikey_registry
+    ):
+        async def pairs(key=None):
+            return [
+                {
+                    "hostId": f"console-{key.label}-1",
+                    "siteId": _UUID_S1 if key.label == "alpha" else _UUID_S2,
+                    "hostName": key.label,
+                    "siteName": f"{key.label} site",
+                }
+            ]
+
+        seen: list[tuple[str, str]] = []
+
+        async def fake_get(path, key=None, **kwargs):
+            seen.append((path, key.label))
+            return {"data": [{"mac": f"aa:bb:cc:00:00:0{len(seen)}"}]}
+
+        multikey_client.get = AsyncMock(side_effect=fake_get)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                "unifi_fabric.tools.aggregation._get_all_host_site_pairs",
+                lambda registry, key=None: pairs(key=key),
+            )
+            result = await _list_all_clients_fleet(multikey_client, multikey_registry)
+        assert result["count"] == 2
+        assert {c["_keyLabel"] for c in result["clients"]} == {"alpha", "beta"}
+        # The beta-owned console is asked with the beta key, not the first one.
+        assert any("console-beta-1" in p and label == "beta" for p, label in seen)
+        assert not any("console-beta-1" in p and label == "alpha" for p, label in seen)

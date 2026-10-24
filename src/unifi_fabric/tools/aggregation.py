@@ -24,6 +24,30 @@ def _resolve_key(client: UniFiClient, key_label: str | None) -> APIKeyConfig | N
     return client.get_key_by_label(key_label)
 
 
+def _fan_out(client: UniFiClient, key_label: str | None) -> list[str] | None:
+    """Labels to aggregate over, or None to query a single key.
+
+    With several keys configured and no ``key_label``, a fleet query covers every
+    key's org, like ``list_hosts`` / ``list_sites``: each key only sees its own
+    Fabric, so asking just the first would silently drop the others.
+    """
+    if key_label is not None:
+        return None
+    labels = client.list_key_labels()
+    return labels if len(labels) > 1 else None
+
+
+async def _devices_over_keys(
+    client: UniFiClient, labels: list[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """/v1/devices from every key, each record tagged with its ``_keyLabel``."""
+    from .site_manager import _aggregate_lists_over_keys
+
+    return await _aggregate_lists_over_keys(
+        client, labels, lambda key: client.paginate("/v1/devices", key=key)
+    )
+
+
 async def _get_all_host_site_pairs(
     registry: Registry,
     *,
@@ -89,8 +113,12 @@ async def _list_all_devices_fleet(
     Optionally filter by status (e.g. 'offline', 'online', 'updating').
     key_label scopes the query to a specific API key for MSP multi-tenant use.
     """
-    key = _resolve_key(client, key_label)
-    all_devices = await client.paginate("/v1/devices", key=key)
+    labels = _fan_out(client, key_label)
+    errors: list[str] = []
+    if labels:
+        all_devices, errors = await _devices_over_keys(client, labels)
+    else:
+        all_devices = await client.paginate("/v1/devices", key=_resolve_key(client, key_label))
 
     if status_filter:
         status_lower = status_filter.lower()
@@ -100,12 +128,17 @@ async def _list_all_devices_fleet(
             if (d.get("status") or d.get("state") or "").lower() == status_lower
         ]
 
-    return {
+    result: dict[str, Any] = {
         "devices": all_devices,
         "count": len(all_devices),
         "filter": status_filter,
         "key_label": key_label,
     }
+    if labels:
+        result["key_labels"] = labels
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 async def _list_all_clients_fleet(
@@ -118,10 +151,27 @@ async def _list_all_clients_fleet(
 
     key_label scopes the query to consoles visible to a specific API key.
     """
-    key = _resolve_key(client, key_label)
-    pairs = await _get_all_host_site_pairs(registry, key=key)
+    labels = _fan_out(client, key_label)
+    keyed_pairs: list[tuple[APIKeyConfig | None, dict[str, str]]] = []
+    key_errors: list[str] = []
+    if labels:
+        keys = [client.get_key_by_label(label) for label in labels]
+        per_key = await asyncio.gather(
+            *[_get_all_host_site_pairs(registry, key=k) for k in keys], return_exceptions=True
+        )
+        for k, found in zip(keys, per_key, strict=True):
+            if isinstance(found, BaseException):
+                key_errors.append(f"{k.label}: {found}")
+                continue
+            keyed_pairs.extend((k, {**p, "keyLabel": k.label}) for p in found)
+        if len(key_errors) == len(keys):
+            raise RuntimeError(f"All {len(keys)} API key(s) failed. First error: {key_errors[0]}")
+    else:
+        key = _resolve_key(client, key_label)
+        keyed_pairs = [(key, p) for p in await _get_all_host_site_pairs(registry, key=key)]
+    pairs = [p for _k, p in keyed_pairs]
 
-    async def _fetch_clients(pair: dict[str, str]) -> dict[str, Any]:
+    async def _fetch_clients(key: APIKeyConfig | None, pair: dict[str, str]) -> dict[str, Any]:
         try:
             data = await client.get(
                 _proxy(pair["hostId"], f"/sites/{pair['siteId']}/clients"),
@@ -133,20 +183,22 @@ async def _list_all_clients_fleet(
                 c["_hostName"] = pair["hostName"]
                 c["_siteId"] = pair["siteId"]
                 c["_siteName"] = pair["siteName"]
+                if "keyLabel" in pair:
+                    c["_keyLabel"] = pair["keyLabel"]
             return {"clients": clients_list, "error": None}
         except Exception as exc:
             return {"clients": [], "error": f"{pair['siteName']}: {exc}"}
 
-    results = await asyncio.gather(*[_fetch_clients(p) for p in pairs])
+    results = await asyncio.gather(*[_fetch_clients(k, p) for k, p in keyed_pairs])
 
     all_clients: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[str] = list(key_errors)
     for r in results:
         all_clients.extend(r["clients"])
         if r["error"]:
             errors.append(r["error"])
 
-    if pairs and len(errors) == len(pairs):
+    if pairs and len(errors) - len(key_errors) == len(pairs):
         raise RuntimeError(f"All {len(pairs)} site(s) failed. First error: {errors[0]}")
 
     result: dict[str, Any] = {
@@ -155,6 +207,8 @@ async def _list_all_clients_fleet(
         "sitesQueried": len(pairs),
         "key_label": key_label,
     }
+    if labels:
+        result["key_labels"] = labels
     if errors:
         result["errors"] = errors
     return result
@@ -186,16 +240,48 @@ async def _fleet_summary(
 
     key_label scopes the summary to consoles visible to a specific API key.
     """
-    key = _resolve_key(client, key_label)
-    hosts_data, sites_data, raw_devices = await asyncio.gather(
-        client.paginate("/v1/hosts", key=key),
-        client.paginate("/v1/sites", key=key),
-        client.paginate("/v1/devices", key=key),
+    labels = _fan_out(client, key_label)
+    keys = (
+        [client.get_key_by_label(label) for label in labels]
+        if labels
+        else [_resolve_key(client, key_label)]
     )
 
-    # Opportunistically refresh registry cache for this key
-    await registry.set_hosts(hosts_data, key=key)
-    await registry.set_ea_sites(sites_data, key=key)
+    async def _one(key: APIKeyConfig | None) -> tuple[list[Any], list[Any], list[Any]]:
+        hosts, sites, devices = await asyncio.gather(
+            client.paginate("/v1/hosts", key=key),
+            client.paginate("/v1/sites", key=key),
+            client.paginate("/v1/devices", key=key),
+        )
+        # Opportunistically refresh registry cache for this key
+        await registry.set_hosts(hosts, key=key)
+        await registry.set_ea_sites(sites, key=key)
+        return hosts, sites, devices
+
+    if not labels:
+        hosts_data, sites_data, raw_devices = await _one(keys[0])
+        per_key: dict[str, dict[str, int]] = {}
+        errors: list[str] = []
+    else:
+        outcomes = await asyncio.gather(*[_one(k) for k in keys], return_exceptions=True)
+        hosts_data, sites_data, raw_devices = [], [], []
+        per_key, errors = {}, []
+        for k, outcome in zip(keys, outcomes, strict=True):
+            label = k.label if k is not None else "default"
+            if isinstance(outcome, BaseException):
+                errors.append(f"{label}: {outcome}")
+                continue
+            hosts, sites, devices = outcome
+            hosts_data.extend(hosts)
+            sites_data.extend(sites)
+            raw_devices.extend(devices)
+            per_key[label] = {
+                "hosts": len(hosts),
+                "sites": len(sites),
+                "devices": len(_unwrap_ea_devices(devices)),
+            }
+        if len(errors) == len(keys):
+            raise RuntimeError(f"All {len(keys)} API key(s) failed. First error: {errors[0]}")
 
     # /v1/devices returns host-wrapper objects — unwrap to actual device dicts
     devices_data = _unwrap_ea_devices(raw_devices)
@@ -214,7 +300,7 @@ async def _fleet_summary(
         dev_type = d.get("productLine") or d.get("type") or "unknown"
         type_counts[dev_type] = type_counts.get(dev_type, 0) + 1
 
-    return {
+    summary: dict[str, Any] = {
         "hosts": len(hosts_data),
         "sites": len(sites_data),
         "devices": {
@@ -224,6 +310,11 @@ async def _fleet_summary(
         },
         "key_label": key_label,
     }
+    if labels:
+        summary["byKey"] = per_key
+    if errors:
+        summary["errors"] = errors
+    return summary
 
 
 async def _search_device(
@@ -236,15 +327,22 @@ async def _search_device(
 
     key_label scopes the search to consoles visible to a specific API key.
     """
-    key = _resolve_key(client, key_label)
-    all_raw = await client.paginate("/v1/devices", key=key)
+    labels = _fan_out(client, key_label)
+    errors: list[str] = []
+    if labels:
+        all_raw, errors = await _devices_over_keys(client, labels)
+    else:
+        all_raw = await client.paginate("/v1/devices", key=_resolve_key(client, key_label))
 
     # /v1/devices returns host-wrapper objects: [{"devices": [...], "hostId": ...}, ...]
     # Unwrap to get the inner device list; fall back to using the item directly if not wrapped.
+    # With several keys the wrapper carries the _keyLabel; copy it onto each device.
     all_devices: list[dict[str, Any]] = []
     for wrapper in all_raw:
         inner = wrapper.get("devices")
         if isinstance(inner, list):
+            if "_keyLabel" in wrapper:
+                inner = [{**d, "_keyLabel": wrapper["_keyLabel"]} for d in inner]
             all_devices.extend(inner)
         else:
             all_devices.append(wrapper)
@@ -272,12 +370,15 @@ async def _search_device(
         if any(query_lower in field.lower() for field in searchable if field):
             matches.append(d)
 
-    return {
+    found: dict[str, Any] = {
         "matches": matches,
         "count": len(matches),
         "query": query,
         "key_label": key_label,
     }
+    if errors:
+        found["errors"] = errors
+    return found
 
 
 async def _list_api_keys(client: UniFiClient) -> dict[str, Any]:
@@ -329,7 +430,8 @@ def register(mcp: FastMCP, deps_fn: Callable[..., Any]) -> None:
         healthy fleet with zero problem devices rather than an error. Omit status_filter to
         get the full fleet, then read the real status values off the returned records.
         key_label: scope query to a specific API key
-        (use list_configured_api_keys to see available keys).
+        (use list_configured_api_keys to see available keys). Omitted with several
+        keys configured: every key's devices, each tagged with _keyLabel.
         """
         client, _ = deps_fn()
         return await _list_all_devices_fleet(
@@ -344,7 +446,8 @@ def register(mcp: FastMCP, deps_fn: Callable[..., Any]) -> None:
 
         Fans out requests to every site and aggregates results with source
         host/site annotations on each client record.
-        key_label: scope query to consoles visible to a specific API key.
+        key_label: scope query to consoles visible to a specific API key. Omitted with
+        several keys configured: every key's sites, each client tagged with _keyLabel.
         """
         client, registry = deps_fn()
         return await _list_all_clients_fleet(client, registry, key_label=key_label)
@@ -356,7 +459,8 @@ def register(mcp: FastMCP, deps_fn: Callable[..., Any]) -> None:
         """Get a high-level fleet summary: host, site, and device counts with status breakdowns.
 
         Useful for a quick overview of the entire UniFi deployment.
-        key_label: scope summary to consoles visible to a specific API key.
+        key_label: scope summary to consoles visible to a specific API key. Omitted with
+        several keys configured: totals over every key, plus a per-key breakdown (byKey).
         """
         client, registry = deps_fn()
         return await _fleet_summary(client, registry, key_label=key_label)
@@ -369,7 +473,8 @@ def register(mcp: FastMCP, deps_fn: Callable[..., Any]) -> None:
         """Search for a device by name, MAC address, or model across the entire fleet.
 
         Returns all matching devices from all consoles.
-        key_label: scope search to consoles visible to a specific API key.
+        key_label: scope search to consoles visible to a specific API key. Omitted with
+        several keys configured: searches every key's devices.
         query: REQUIRED. Search string matched against device name, model, and MAC across the fleet.
         """
         client, _ = deps_fn()

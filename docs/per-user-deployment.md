@@ -98,6 +98,6 @@ All keys are checked at login (one refused key fails the login and the page
 names it) and on every revalidation. Inside a request the keys behave like the
 upstream multi-key setup: `list_hosts` and `list_sites` aggregate across all of
 them and tag each item with `_keyLabel`, and per-console tools use the key whose
-Fabric owns the console. The fleet aggregation tools (`list_all_devices`,
-`get_fleet_summary`, ...) use the first key unless given a `key_label` from that
+Fabric owns the console. The fleet tools (`list_all_devices`,
+`get_fleet_summary`, ...) cover every key too, unless given a `key_label` from that
 list. To add or remove a Fabric, reconnect the connector and paste the new set.
