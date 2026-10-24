@@ -119,6 +119,7 @@ Site Manager (Fabric) API.
 - **Site**: A logical network partition within a host. Most single-console setups have
   one site called "Default".
 - Both `host` and `site` parameters accept human-readable names OR IDs. Prefer names.
+  `host` also accepts the console's MAC address.
 - **Device** (in UniFi terminology): network infrastructure hardware — APs, switches,
   gateways, cameras, sensors. Managed via `list_site_devices`, `get_device`, etc.
 - **Client**: an end-user device connected to the network (laptop, phone, IoT device).

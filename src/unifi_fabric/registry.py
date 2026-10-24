@@ -26,6 +26,49 @@ _UUID_RE = re.compile(
 
 _PROXY_SITES_PATH = "/v1/connector/consoles/{host_id}/proxy/network/integration/v1/sites"
 
+_MAC_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _norm_name(value: str) -> str:
+    """Case- and whitespace-insensitive form of a console name."""
+    return " ".join(value.split()).casefold()
+
+
+def _norm_mac(value: str) -> str:
+    """``aa:bb:cc-dd.ee ff`` style MAC to 12 lowercase hex digits ('' if not a MAC)."""
+    mac = re.sub(r"[\s:.-]", "", value).lower()
+    return mac if _MAC_RE.match(mac) else ""
+
+
+def _host_matches(host: dict[str, Any], name_or_id: str) -> bool:
+    """Whether ``name_or_id`` names this ``/v1/hosts`` record.
+
+    Matches the exact ``id``; the console name (``reportedState.name``, the name
+    shown in Site Manager and in ``list_hosts``), ``reportedState.hostname`` or a
+    top-level ``name``, all case- and whitespace-insensitive, so names with spaces,
+    dots or parentheses work; or the console's MAC address in any notation
+    (``reportedState.mac``, ``reportedState.hardware.mac``, or the MAC prefix of a
+    composite ``{MAC}...:{n}`` id).
+    """
+    if host.get("id") == name_or_id:
+        return True
+    reported = host.get("reportedState") or {}
+    needle = _norm_name(name_or_id)
+    if needle and any(
+        isinstance(v, str) and _norm_name(v) == needle
+        for v in (reported.get("name"), reported.get("hostname"), host.get("name"))
+    ):
+        return True
+    mac = _norm_mac(name_or_id)
+    if not mac:
+        return False
+    hardware = reported.get("hardware") or {}
+    macs = [reported.get("mac"), hardware.get("mac") if isinstance(hardware, dict) else None]
+    if any(isinstance(m, str) and _norm_mac(m) == mac for m in macs):
+        return True
+    host_id = host.get("id")
+    return isinstance(host_id, str) and ":" in host_id and host_id[:12].lower() == mac
+
 
 def _assert_uuid(site_id: str) -> None:
     """Raise ValueError if site_id is not a valid UUID.
@@ -170,8 +213,8 @@ class Registry:
         fails with "403 forbidden: host not found" even though the host exists
         and the caller's key is valid (see public issue #19).
 
-        Matching mirrors :meth:`resolve_host_id`: id, hostname, or name
-        (case-insensitive). Returns the matching key config, or ``None`` when
+        Matching mirrors :meth:`resolve_host_id` (see :func:`_host_matches`): id,
+        console name, hostname, or MAC address. Returns the matching key config, or ``None`` when
         no configured key owns the host — callers pass that ``None`` straight
         through to ``resolve_host_id`` / ``resolve_site_id`` / the HTTP client,
         which fall back to the default (first) key, preserving today's
@@ -192,7 +235,6 @@ class Registry:
         labels = self._client.list_key_labels()
         if len(labels) <= 1:
             return None
-        needle = name_or_id.lower()
 
         async def _match(label: str) -> tuple[str, bool, Exception | None]:
             key_config = self._client.get_key_by_label(label)
@@ -200,14 +242,8 @@ class Registry:
                 hosts = await self.get_hosts(key=key_config)
             except Exception as exc:
                 return label, False, exc
-            for host in hosts:
-                reported = host.get("reportedState") or {}
-                if (
-                    host.get("id") == name_or_id
-                    or reported.get("hostname", "").lower() == needle
-                    or host.get("name", "").lower() == needle
-                ):
-                    return label, True, None
+            if any(_host_matches(host, name_or_id) for host in hosts):
+                return label, True, None
             return label, False, None
 
         results = await asyncio.gather(*[_match(label) for label in labels])
@@ -236,19 +272,18 @@ class Registry:
             raise ValueError("'host' must not be empty")
         hosts = await self.get_hosts(key=key)
         for host in hosts:
-            if host.get("id") == name_or_id:
-                validate_host_id(name_or_id, "host_id")
-                return name_or_id
-            if host.get("reportedState", {}).get("hostname", "").lower() == name_or_id.lower():
-                resolved = host["id"]
+            if _host_matches(host, name_or_id):
+                resolved = cast(str, host["id"])
                 validate_host_id(resolved, "host_id")
                 return resolved
-            if host.get("name", "").lower() == name_or_id.lower():
-                resolved = host["id"]
-                validate_host_id(resolved, "host_id")
-                return resolved
-        # assume it's a raw ID — validate before using in a URL path
-        validate_host_id(name_or_id, "host_id")
+        # Not a known console: only something shaped like a raw ID is passed on.
+        try:
+            validate_host_id(name_or_id, "host_id")
+        except ValueError:
+            raise ValueError(
+                f"Host {name_or_id!r} not found: no console has that id, name or MAC. "
+                "Call list_hosts for the exact names and ids."
+            ) from None
         return name_or_id
 
     async def resolve_site_id(

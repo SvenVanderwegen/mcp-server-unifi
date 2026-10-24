@@ -647,3 +647,82 @@ class TestGetHostsPath:
     async def test_get_hosts_calls_v1_path(self, registry, mock_client):
         await registry.get_hosts()
         mock_client.paginate.assert_called_once_with("/v1/hosts", key=None)
+
+
+# --- console names and MAC addresses (Site Manager host shape) ---
+
+# Site Manager puts the console name under reportedState.name; there is no
+# top-level "name". Composite ids start with the console MAC. All synthetic.
+_SM_HOSTS = [
+    {
+        "id": "02AA00000001000000000000000000000000000000000000000000000000:111",
+        "reportedState": {
+            "name": "Dr. Test Console (Testville)",
+            "hostname": "UDM-Pro",
+            "hardware": {"mac": "02AA00000001"},
+        },
+    },
+    {
+        "id": "0aa00000-0000-4000-8000-000000000002",
+        "reportedState": {"name": "Example  Fresh", "mac": "02:aa:00:00:00:02"},
+    },
+]
+
+
+@pytest.fixture
+def sm_registry():
+    client = AsyncMock()
+    client.paginate = AsyncMock(return_value=list(_SM_HOSTS))
+    return Registry(client, ttl_seconds=900)
+
+
+class TestResolveHostByConsoleNameOrMac:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "needle",
+        [
+            "Dr. Test Console (Testville)",
+            "dr. test console  (testville)",
+            " Dr. Test Console (Testville) ",
+        ],
+    )
+    async def test_name_with_spaces_dots_and_parentheses(self, sm_registry, needle):
+        assert await sm_registry.resolve_host_id(needle) == _SM_HOSTS[0]["id"]
+
+    @pytest.mark.asyncio
+    async def test_name_whitespace_is_normalised(self, sm_registry):
+        assert await sm_registry.resolve_host_id("example fresh") == _SM_HOSTS[1]["id"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mac", ["02AA00000001", "02:aa:00:00:00:01", "02-AA-00-00-00-01"])
+    async def test_mac_from_hardware_or_id_prefix(self, sm_registry, mac):
+        assert await sm_registry.resolve_host_id(mac) == _SM_HOSTS[0]["id"]
+
+    @pytest.mark.asyncio
+    async def test_mac_from_reported_state(self, sm_registry):
+        assert await sm_registry.resolve_host_id("02aa00000002") == _SM_HOSTS[1]["id"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_says_not_found(self, sm_registry):
+        with pytest.raises(ValueError, match="'Nobody Here' not found.*list_hosts"):
+            await sm_registry.resolve_host_id("Nobody Here")
+
+    @pytest.mark.asyncio
+    async def test_unknown_mac_is_passed_on_as_a_raw_id(self, sm_registry):
+        assert await sm_registry.resolve_host_id("02AA000000FF") == "02AA000000FF"
+
+    @pytest.mark.asyncio
+    async def test_multikey_picks_the_beta_key_by_console_name_and_mac(
+        self, multikey_client, multikey_registry
+    ):
+        alpha = multikey_client.get_key_by_label("alpha")
+        beta = multikey_client.get_key_by_label("beta")
+        await multikey_registry.set_hosts(
+            [{"id": "console-alpha-1", "reportedState": {"name": "Alpha HQ"}}], key=alpha
+        )
+        await multikey_registry.set_hosts(list(_SM_HOSTS), key=beta)
+        for needle in ("Dr. Test Console (Testville)", "02:AA:00:00:00:01"):
+            key = await multikey_registry.resolve_key_for_host(needle)
+            assert key is not None and key.label == "beta"
+            assert await multikey_registry.resolve_host_id(needle, key=key) == _SM_HOSTS[0]["id"]
+        assert (await multikey_registry.resolve_key_for_host("alpha hq")).label == "alpha"
