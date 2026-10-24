@@ -12,7 +12,12 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     && pip install --no-cache-dir --require-hashes -r requirements.lock \
     && pip install --no-cache-dir --no-deps . \
     && groupadd --gid 10001 mcp \
-    && useradd --uid 10001 --gid 10001 --no-create-home --shell /sbin/nologin mcp
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /sbin/nologin mcp \
+    && mkdir -p /data && chown mcp:mcp /data
+
+# MCP_AUTH_MODE=user_key keeps its OAuth state (encrypted user keys, tokens)
+# here. A named volume mounted on /data inherits this ownership on first use.
+VOLUME ["/data"]
 
 ENV UNIFI_API_BASE_URL=https://api.ui.com
 ENV UNIFI_CACHE_TTL_SECONDS=900

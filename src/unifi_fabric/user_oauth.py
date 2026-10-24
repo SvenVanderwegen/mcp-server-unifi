@@ -1,0 +1,701 @@
+"""Per-user mode (``MCP_AUTH_MODE=user_key``): this server as its own OAuth server.
+
+Claude (custom connectors) and Microsoft Copilot connect to a remote MCP server
+through OAuth 2.1 with PKCE. FastMCP's :class:`OAuthProvider` serves the
+standard endpoints (metadata, ``/authorize``, ``/token``, ``/register``,
+``/revoke``); this module supplies the provider behind them and the one piece
+they leave to the server: the page where the user proves who they are.
+
+That page asks for the user's own UniFi Site Manager API key, checks it against
+``api.ui.com``, and only then issues an authorization code. The key is stored
+encrypted (see ``oauth_store``) and every MCP request made with the resulting
+access token runs on that key (see ``user_keys`` and :class:`UserKeyMiddleware`),
+so each person reaches exactly the consoles their own UniFi account can reach,
+with their own permissions.
+
+Flow::
+
+    client ──/authorize──▶ provider.authorize() ──302──▶ /oauth/login?txn=…
+    user   ──POST API key──▶ GET /v1/hosts ──302──▶ client redirect_uri?code=…
+    client ──/token──▶ access + refresh token (subject = digest of the key)
+    client ──/mcp, Bearer──▶ UserKeyMiddleware ──▶ tools run on that user's key
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import secrets
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from fastmcp.server.auth import AccessToken, OAuthProvider
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    RefreshToken,
+    RegistrationError,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyUrl
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
+
+from .config import MCPTransportSettings
+from .oauth_store import OAuthStore
+from .user_keys import (
+    key_config_for,
+    reset_current_user_key,
+    set_current_user_key,
+    user_id_for_key,
+)
+
+_logger = logging.getLogger(__name__)
+
+# The single scope this server knows. Clients that ask for none get it; it
+# exists so a hand-configured client (Copilot) has something to put in its
+# scope field.
+OAUTH_SCOPE = "unifi"
+
+LOGIN_PATH = "/oauth/login"
+
+# A pending login (between /authorize and the form submit) and an issued
+# authorization code live this long, in memory only: a restart in the middle of
+# a login just means trying again.
+PENDING_LOGIN_TTL = 600
+AUTH_CODE_TTL = 300
+
+# Rejected keys tolerated on one login attempt before it is discarded.
+MAX_LOGIN_ATTEMPTS = 5
+
+# Short timeout for the key check: the user is waiting on the login page.
+KEY_CHECK_TIMEOUT = 15.0
+
+
+class KeyRejectedError(Exception):
+    """The Site Manager API refused the key."""
+
+
+class UniFiUnreachableError(Exception):
+    """The Site Manager API could not be asked."""
+
+
+class UserAuthorizationCode(AuthorizationCode):
+    """Authorization code bound to the key the user logged in with."""
+
+    user_id: str
+
+
+class UserRefreshToken(RefreshToken):
+    """Refresh token that remembers its grant, so rotation can revoke its pair."""
+
+    grant_id: str
+
+
+@dataclass
+class _PendingLogin:
+    client_id: str
+    client_name: str
+    params: AuthorizationParams
+    expires_at: float
+    attempts: int = 0
+
+
+@dataclass
+class _Revalidations:
+    """Per-user locks so a burst of requests triggers one revalidation, not N."""
+
+    locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    def lock_for(self, user_id: str) -> asyncio.Lock:
+        return self.locks.setdefault(user_id, asyncio.Lock())
+
+
+def redirect_uri_allowed(uri: str, allowed_hosts: list[str]) -> bool:
+    """Whether a dynamically registered client may use this redirect URI.
+
+    The login page hands an authorization code to whatever redirect URI the
+    client registered, so open registration would let anyone phish a
+    colleague's key through this very page. ``allowed_hosts`` entries match a
+    hostname exactly, or any subdomain when they start with ".". Loopback
+    redirects may use plain http (native clients listen on localhost);
+    everything else must be https.
+    """
+    parsed = urlparse(uri)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    loopback = host in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+        return False
+    for entry in allowed_hosts:
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry.startswith("."):
+            if host.endswith(entry):
+                return True
+        elif host == entry:
+            return True
+    return False
+
+
+async def check_api_key(api_base_url: str, api_key: str) -> int:
+    """Ask the Site Manager API whether it accepts a key.
+
+    Returns:
+        The number of consoles (hosts) the key can see.
+
+    Raises:
+        KeyRejectedError: The API answered 401/403.
+        UniFiUnreachableError: The API could not be reached or failed.
+    """
+    try:
+        async with httpx.AsyncClient(
+            base_url=api_base_url,
+            headers={"X-API-KEY": api_key, "Accept": "application/json"},
+            timeout=KEY_CHECK_TIMEOUT,
+        ) as client:
+            resp = await client.get("/v1/hosts")
+    except httpx.HTTPError as exc:
+        raise UniFiUnreachableError(type(exc).__name__) from None
+    if resp.status_code in (401, 403):
+        raise KeyRejectedError(f"HTTP {resp.status_code}")
+    if resp.is_error:
+        raise UniFiUnreachableError(f"HTTP {resp.status_code}")
+    try:
+        data = resp.json().get("data", [])
+    except ValueError:
+        raise UniFiUnreachableError("non-JSON response") from None
+    return len(data) if isinstance(data, list) else 0
+
+
+class UserKeyOAuthProvider(OAuthProvider):
+    """OAuth authorization server whose users authenticate with a UniFi API key."""
+
+    def __init__(
+        self, transport: MCPTransportSettings, store: OAuthStore, api_base_url: str
+    ) -> None:
+        super().__init__(
+            base_url=transport.public_url,
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=[OAUTH_SCOPE],
+                default_scopes=[OAUTH_SCOPE],
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+        )
+        self.settings = transport
+        self.store = store
+        self.api_base_url = api_base_url
+        self.public_url = transport.public_url.rstrip("/")
+        self._pending: dict[str, _PendingLogin] = {}
+        self._codes: dict[str, UserAuthorizationCode] = {}
+        self._revalidations = _Revalidations()
+        self._static_client = self._build_static_client()
+
+    def _build_static_client(self) -> OAuthClientInformationFull | None:
+        if not self.settings.oauth_client_id:
+            return None
+        return OAuthClientInformationFull(
+            client_id=self.settings.oauth_client_id,
+            client_secret=self.settings.oauth_client_secret,
+            client_name="Pre-registered client",
+            redirect_uris=[AnyUrl(u) for u in self.settings.oauth_client_redirect_uris],
+            token_endpoint_auth_method=self.settings.oauth_client_auth_method,
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            scope=OAUTH_SCOPE,
+        )
+
+    # Clients ----------------------------------------------------------------
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        if self._static_client is not None and secrets.compare_digest(
+            client_id.encode(), (self._static_client.client_id or "").encode()
+        ):
+            return self._static_client
+        return self.store.get_client(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        for uri in client_info.redirect_uris or []:
+            if not redirect_uri_allowed(str(uri), self.settings.oauth_allowed_redirect_hosts):
+                _logger.warning("Refused client registration with redirect URI %s", uri)
+                raise RegistrationError(
+                    error="invalid_redirect_uri",
+                    error_description=(
+                        f"Redirect URI {uri} is not allowed. The server operator can "
+                        "add its host to MCP_OAUTH_ALLOWED_REDIRECT_HOSTS."
+                    ),
+                )
+        self.store.save_client(client_info)
+        _logger.info(
+            "Registered OAuth client %s (%s)",
+            client_info.client_id,
+            client_info.client_name or "unnamed",
+        )
+
+    # Authorization ----------------------------------------------------------
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        self._purge()
+        if not params.scopes:
+            params = params.model_copy(update={"scopes": [OAUTH_SCOPE]})
+        txn = secrets.token_urlsafe(32)
+        self._pending[txn] = _PendingLogin(
+            client_id=client.client_id or "",
+            client_name=client.client_name or "",
+            params=params,
+            expires_at=time.time() + PENDING_LOGIN_TTL,
+        )
+        return f"{self.public_url}{LOGIN_PATH}?txn={txn}"
+
+    def pending_login(self, txn: str) -> _PendingLogin | None:
+        """A pending login that has not expired, or None."""
+        pending = self._pending.get(txn)
+        if pending is None or pending.expires_at < time.time():
+            self._pending.pop(txn, None)
+            return None
+        return pending
+
+    async def complete_login(self, txn: str, name: str, api_key: str) -> tuple[str, int]:
+        """Check the submitted key and finish the authorization.
+
+        Returns:
+            The client redirect URL carrying the authorization code, and the
+            number of consoles the key can see.
+
+        Raises:
+            AuthorizeError: The login attempt is unknown or used up.
+            KeyRejectedError: The Site Manager API refused the key.
+            UniFiUnreachableError: The Site Manager API could not be reached.
+        """
+        pending = self.pending_login(txn)
+        if pending is None:
+            raise AuthorizeError(error="invalid_request", error_description="Login expired")
+        try:
+            hosts = await check_api_key(self.api_base_url, api_key)
+        except KeyRejectedError:
+            pending.attempts += 1
+            if pending.attempts >= MAX_LOGIN_ATTEMPTS:
+                self._pending.pop(txn, None)
+                _logger.warning(
+                    "Login for client %s abandoned after too many rejected keys",
+                    pending.client_id,
+                )
+            raise
+        self._pending.pop(txn, None)
+
+        user_id = user_id_for_key(api_key)
+        self.store.upsert_user(user_id, name, api_key)
+        _logger.info("User %s (%s) logged in; key sees %d console(s)", user_id, name, hosts)
+
+        code = secrets.token_urlsafe(32)
+        params = pending.params
+        self._codes[code] = UserAuthorizationCode(
+            code=code,
+            scopes=params.scopes or [OAUTH_SCOPE],
+            expires_at=time.time() + AUTH_CODE_TTL,
+            client_id=pending.client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+            user_id=user_id,
+        )
+        target = construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+        return target, hosts
+
+    def abandon_login(self, txn: str) -> str | None:
+        """Cancel a pending login; returns the client redirect carrying the error."""
+        pending = self._pending.pop(txn, None)
+        if pending is None:
+            return None
+        return construct_redirect_uri(
+            str(pending.params.redirect_uri),
+            error="access_denied",
+            error_description="The user cancelled the login",
+            state=pending.params.state,
+        )
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> UserAuthorizationCode | None:
+        code = self._codes.get(authorization_code)
+        if code is None or code.client_id != client.client_id:
+            return None
+        return code
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        # Single use: popping before issuing means a replayed code finds
+        # nothing, even when two exchanges race.
+        code = self._codes.pop(authorization_code.code, None)
+        if code is None:
+            raise TokenError(error="invalid_grant", error_description="Code already used")
+        self.store.purge_expired()
+        return self._issue(
+            client_id=client.client_id or "",
+            user_id=code.user_id,
+            scopes=code.scopes,
+            resource=code.resource,
+            grant_id=secrets.token_urlsafe(16),
+        )
+
+    # Tokens -----------------------------------------------------------------
+
+    def _issue(
+        self,
+        *,
+        client_id: str,
+        user_id: str,
+        scopes: list[str],
+        resource: str | None,
+        grant_id: str,
+    ) -> OAuthToken:
+        now = int(time.time())
+        access = secrets.token_urlsafe(32)
+        refresh = secrets.token_urlsafe(32)
+        common: dict[str, Any] = {
+            "grant_id": grant_id,
+            "client_id": client_id,
+            "user_id": user_id,
+            "scopes": scopes,
+            "resource": resource,
+        }
+        self.store.add_token(
+            access,
+            kind="access",
+            expires_at=now + self.settings.oauth_access_token_ttl,
+            **common,
+        )
+        self.store.add_token(
+            refresh,
+            kind="refresh",
+            expires_at=now + self.settings.oauth_refresh_token_ttl,
+            **common,
+        )
+        return OAuthToken(
+            access_token=access,
+            token_type="Bearer",  # noqa: S106 -- token type, not a credential
+            expires_in=self.settings.oauth_access_token_ttl,
+            scope=" ".join(scopes) if scopes else None,
+            refresh_token=refresh,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> UserRefreshToken | None:
+        stored = self.store.get_token(refresh_token, "refresh")
+        if stored is None or stored.client_id != client.client_id:
+            return None
+        return UserRefreshToken(
+            token=refresh_token,
+            client_id=stored.client_id,
+            scopes=stored.scopes,
+            expires_at=stored.expires_at,
+            grant_id=stored.grant_id,
+        )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        stored = self.store.get_token(refresh_token.token, "refresh")
+        if stored is None:
+            raise TokenError(error="invalid_grant", error_description="Refresh token revoked")
+        # Rotation: the old refresh token and its access token die with the
+        # exchange, so a leaked refresh token stops working once the real
+        # client uses it.
+        self.store.delete_grant(stored.grant_id)
+        if self.store.get_user(stored.user_id) is None:
+            raise TokenError(
+                error="invalid_grant",
+                error_description="The UniFi API key for this user is gone; log in again",
+            )
+        return self._issue(
+            client_id=stored.client_id,
+            user_id=stored.user_id,
+            scopes=scopes or stored.scopes,
+            resource=stored.resource,
+            grant_id=stored.grant_id,
+        )
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        stored = self.store.get_token(token, "access")
+        if stored is None:
+            return None
+        user = self.store.get_user(stored.user_id)
+        if user is None:
+            return None
+        if time.time() - user.validated_at > self.settings.oauth_revalidate_interval:
+            async with self._revalidations.lock_for(stored.user_id):
+                # Another request may have revalidated while this one waited.
+                user = self.store.get_user(stored.user_id)
+                if user is None:
+                    return None
+                if time.time() - user.validated_at > self.settings.oauth_revalidate_interval:
+                    if not await self._revalidate(user.user_id, user.api_key):
+                        return None
+        return AccessToken(
+            token=token,
+            client_id=stored.client_id,
+            scopes=stored.scopes,
+            expires_at=stored.expires_at,
+            resource=stored.resource,
+            claims={"sub": stored.user_id, "user_id": stored.user_id, "name": user.name},
+        )
+
+    async def _revalidate(self, user_id: str, api_key: str) -> bool:
+        """Re-check a stored key. False only when UniFi says the key is no longer valid."""
+        try:
+            await check_api_key(self.api_base_url, api_key)
+        except KeyRejectedError:
+            _logger.info("Stored key of user %s was rejected by UniFi; forgetting it", user_id)
+            self.store.delete_user(user_id)
+            return False
+        except UniFiUnreachableError as exc:
+            # An outage at api.ui.com must not log everyone out; the tool calls
+            # themselves will report the outage.
+            _logger.warning("Could not revalidate user %s: %s", user_id, exc)
+            return True
+        self.store.mark_validated(user_id)
+        return True
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        stored = self.store.get_token(token.token, "access") or self.store.get_token(
+            token.token, "refresh"
+        )
+        if stored is not None:
+            self.store.delete_grant(stored.grant_id)
+        else:
+            self.store.delete_token(token.token)
+
+    # Housekeeping -----------------------------------------------------------
+
+    def _purge(self) -> None:
+        now = time.time()
+        for txn in [t for t, p in self._pending.items() if p.expires_at < now]:
+            del self._pending[txn]
+        for code in [c for c, a in self._codes.items() if a.expires_at < now]:
+            del self._codes[code]
+
+
+class UserKeyMiddleware(Middleware):
+    """Run every MCP request on the calling user's own UniFi key.
+
+    The transport has already authenticated the bearer token; this looks up the
+    key that token was issued for and places it in the ``user_keys`` context for
+    the duration of the request. A request without one fails rather than
+    falling back to any other key.
+    """
+
+    def __init__(self, store: OAuthStore) -> None:
+        self.store = store
+
+    async def on_request(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
+        token = get_access_token()
+        user_id = (token.claims.get("user_id") if token is not None else None) or None
+        user = self.store.get_user(user_id) if user_id else None
+        if user is None:
+            raise PermissionError(
+                "No UniFi API key is linked to this session. Reconnect the connector "
+                "and log in with your UniFi API key."
+            )
+        reset = set_current_user_key(key_config_for(user.api_key))
+        try:
+            return await call_next(context)
+        finally:
+            reset_current_user_key(reset)
+
+
+# Login page -----------------------------------------------------------------
+
+_PAGE_HEADERS = {
+    # The page takes a credential: never cache it, never let another site frame
+    # it (clickjacking the submit button), load nothing external. No
+    # form-action directive: browsers apply it to the redirect that follows the
+    # submit, which goes to the client's own domain.
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+    ),
+}
+
+_PAGE = """<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UniFi koppelen</title>
+<style>
+  :root {{ color-scheme: light dark; --fg:#1f2328; --muted:#59636e; --bg:#f6f8fa; --card:#fff;
+          --line:#d1d9e0; --accent:#006fff; --err:#b42318; }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --fg:#e6edf3; --muted:#9198a1; --bg:#0d1117; --card:#161b22; --line:#30363d;
+            --accent:#4797ff; --err:#f97066; }} }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; min-height:100vh; display:grid; place-items:center; padding:16px;
+         font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--fg);
+         background:var(--bg); }}
+  main {{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--line);
+         border-radius:12px; padding:28px; }}
+  h1 {{ font-size:1.3rem; margin:0 0 4px; }}
+  p {{ margin:0 0 16px; color:var(--muted); }}
+  label {{ display:block; font-weight:600; margin:16px 0 6px; }}
+  input {{ width:100%; padding:10px 12px; font:inherit; color:inherit; background:transparent;
+          border:1px solid var(--line); border-radius:8px; }}
+  input:focus {{ outline:2px solid var(--accent); outline-offset:1px; }}
+  .row {{ display:flex; gap:12px; margin-top:24px; }}
+  button {{ flex:1; padding:10px 12px; font:inherit; font-weight:600; border-radius:8px;
+           cursor:pointer; border:1px solid var(--accent); }}
+  .primary {{ background:var(--accent); color:#fff; }}
+  .secondary {{ background:transparent; color:var(--fg); border-color:var(--line); }}
+  .error {{ color:var(--err); font-weight:600; }}
+  .client {{ font-size:.9rem; }}
+  details {{ margin-top:16px; color:var(--muted); font-size:.9rem; }}
+</style>
+</head>
+<body>
+<main>
+  <h1>UniFi koppelen</h1>
+  <p class="client">{client}</p>
+  {message}
+  <form method="post" action="{action}">
+    <input type="hidden" name="txn" value="{txn}">
+    <label for="name">Je naam</label>
+    <input id="name" name="name" type="text" autocomplete="name" required maxlength="100"
+           value="{name}">
+    <label for="api_key">Persoonlijke UniFi API key</label>
+    <input id="api_key" name="api_key" type="password" autocomplete="off" required>
+    <div class="row">
+      <button class="secondary" type="submit" name="action" value="cancel"
+              formnovalidate>Annuleren</button>
+      <button class="primary" type="submit" name="action" value="login">Koppelen</button>
+    </div>
+  </form>
+  <details>
+    <summary>Waar vind ik mijn API key?</summary>
+    Meld je aan op <em>unifi.ui.com</em>, open <em>API</em> in het menu links (of
+    <em>Settings &rarr; API Keys</em>) en kies <em>Create API Key</em>.
+    De assistent ziet dan precies de consoles die jouw UniFi-account ziet, en alles
+    wat hij doet gebeurt met jouw rechten.
+  </details>
+</main>
+</body>
+</html>
+"""
+
+
+def _render(provider: UserKeyOAuthProvider, txn: str, *, message: str = "", name: str = "") -> str:
+    pending = provider.pending_login(txn)
+    client = ""
+    if pending is not None:
+        target = urlparse(str(pending.params.redirect_uri)).hostname or ""
+        app = pending.client_name or "Een toepassing"
+        client = (
+            f"{html.escape(app)} vraagt toegang tot UniFi en stuurt je daarna terug naar "
+            f"<strong>{html.escape(target)}</strong>."
+        )
+    return _PAGE.format(
+        client=client,
+        message=f'<p class="error" role="alert">{html.escape(message)}</p>' if message else "",
+        action=html.escape(LOGIN_PATH),
+        txn=html.escape(txn),
+        name=html.escape(name),
+    )
+
+
+def _expired_page() -> HTMLResponse:
+    body = (
+        '<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>UniFi koppelen</title>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+        '<body style="font-family:system-ui,sans-serif;padding:16px">'
+        "<h1>Deze aanmelding is verlopen</h1>"
+        "<p>Start het koppelen opnieuw vanuit Claude of Copilot.</p></body></html>"
+    )
+    return HTMLResponse(body, status_code=400, headers=_PAGE_HEADERS)
+
+
+def install_login_routes(app: Any, provider: UserKeyOAuthProvider) -> None:
+    """Register the login page on a FastMCP app.
+
+    Custom routes are served without bearer authentication, which is the point:
+    the user has no token yet.
+    """
+
+    @app.custom_route(LOGIN_PATH, methods=["GET"])
+    async def login_form(request: Request) -> Response:
+        txn = request.query_params.get("txn", "")
+        if provider.pending_login(txn) is None:
+            return _expired_page()
+        return HTMLResponse(_render(provider, txn), headers=_PAGE_HEADERS)
+
+    @app.custom_route(LOGIN_PATH, methods=["POST"])
+    async def login_submit(request: Request) -> Response:
+        form = await request.form()
+        txn = str(form.get("txn", ""))
+        name = str(form.get("name", "")).strip()[:100]
+        api_key = str(form.get("api_key", "")).strip()
+
+        if form.get("action") == "cancel":
+            target = provider.abandon_login(txn)
+            if target is None:
+                return _expired_page()
+            return RedirectResponse(target, status_code=302, headers=_PAGE_HEADERS)
+
+        if provider.pending_login(txn) is None:
+            return _expired_page()
+        if not name or not api_key:
+            return HTMLResponse(
+                _render(provider, txn, message="Vul je naam en API key in.", name=name),
+                status_code=400,
+                headers=_PAGE_HEADERS,
+            )
+        try:
+            target, _hosts = await provider.complete_login(txn, name, api_key)
+        except KeyRejectedError:
+            if provider.pending_login(txn) is None:
+                return _expired_page()
+            return HTMLResponse(
+                _render(
+                    provider,
+                    txn,
+                    message="UniFi aanvaardt deze API key niet. Controleer hem en probeer opnieuw.",
+                    name=name,
+                ),
+                status_code=401,
+                headers=_PAGE_HEADERS,
+            )
+        except AuthorizeError:
+            return _expired_page()
+        except UniFiUnreachableError as exc:
+            _logger.error("Site Manager API unreachable during login: %s", exc)
+            return HTMLResponse(
+                _render(
+                    provider,
+                    txn,
+                    message="UniFi is momenteel niet bereikbaar. Probeer het straks opnieuw.",
+                    name=name,
+                ),
+                status_code=503,
+                headers=_PAGE_HEADERS,
+            )
+        return RedirectResponse(target, status_code=302, headers=_PAGE_HEADERS)

@@ -6,6 +6,14 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **This fork** (`SvenVanderwegen/mcp-server-unifi`) adds a per-user mode,
+> `MCP_AUTH_MODE=user_key`: the server is its own OAuth server, every person logs
+> in with their own UniFi Site Manager API key, and every tool call runs on that
+> key. Works with Claude and Microsoft 365 Copilot. See
+> [docs/per-user-deployment.md](docs/per-user-deployment.md) and
+> `docker-compose.yml`. Everything else tracks upstream
+> [swkstudios/unifi-fabric-mcp-server](https://github.com/swkstudios/unifi-fabric-mcp-server).
+
 > **Cloud-first UniFi management for AI agents.** This server connects to the official UniFi Site Manager / Fabric cloud API (`api.ui.com`) — no direct controller access, SSH, or local network access required. Manage your entire UniFi fleet from anywhere through natural language.
 
 An MCP (Model Context Protocol) server that exposes the UniFi Site Manager API as tools for AI assistants. Built with [FastMCP](https://github.com/PrefectHQ/fastmcp), it lets Claude Code, Cline, and other MCP clients manage UniFi network infrastructure through natural language.

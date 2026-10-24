@@ -16,6 +16,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AuthProvider
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .client import UniFiClient
 from .config import MCPTransportSettings, Settings
@@ -72,7 +74,16 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         force=True,
     )
-    if not settings.get_key_configs():
+    if _mcp_transport.user_key_mode:
+        # Fail closed: in per-user mode every call must run on the caller's own
+        # key. A server-wide key would be one forgotten code path away from
+        # being used on someone's behalf.
+        if settings.get_key_configs():
+            raise RuntimeError(
+                "MCP_AUTH_MODE=user_key uses each user's own UniFi API key; "
+                "remove UNIFI_API_KEY / UNIFI_API_KEYS from the environment."
+            )
+    elif not settings.get_key_configs():
         raise RuntimeError(
             "No API key configured. Set UNIFI_API_KEY or UNIFI_API_KEYS before starting the server."
         )
@@ -325,6 +336,9 @@ def build_auth(s: MCPTransportSettings) -> AuthProvider | None:
 
     - ``"none"``   -> ``None`` (no transport auth)
     - ``"bearer"`` -> ``StaticTokenVerifier`` over the shared MCP_BEARER_TOKEN secret
+    - ``"user_key"`` -> ``UserKeyOAuthProvider``: this server is its own OAuth
+      authorization server and each user logs in with their own UniFi API key
+      (see ``user_oauth``)
     - ``"oauth"``  -> ``RemoteAuthProvider`` wrapping a ``JWTVerifier`` (this server
       is an OAuth 2.0 **resource server**: it verifies bearer JWTs minted by an
       external authorization server and advertises itself via the
@@ -342,6 +356,12 @@ def build_auth(s: MCPTransportSettings) -> AuthProvider | None:
         from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
         return StaticTokenVerifier(tokens={s.bearer_token: {"client_id": "mcp", "scopes": []}})
+    if mode == "user_key":
+        from .oauth_store import OAuthStore
+        from .user_oauth import UserKeyOAuthProvider
+
+        store = OAuthStore(s.oauth_db_path, s.secret_key)
+        return UserKeyOAuthProvider(s, store, get_settings().api_base_url)
     if mode == "oauth":
         from fastmcp.server.auth import RemoteAuthProvider
         from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -416,6 +436,27 @@ mcp = FastMCP(
     lifespan=lifespan,
     auth=build_auth(_mcp_transport),
 )
+
+
+def _install_user_key_mode(app: FastMCP) -> None:
+    """Login page and per-request key binding for ``MCP_AUTH_MODE=user_key``."""
+    from .user_oauth import UserKeyMiddleware, UserKeyOAuthProvider, install_login_routes
+
+    provider = app.auth
+    if not isinstance(provider, UserKeyOAuthProvider):
+        raise RuntimeError("MCP_AUTH_MODE=user_key requires the user-key OAuth provider")
+    install_login_routes(app, provider)
+    app.add_middleware(UserKeyMiddleware(provider.store))
+
+
+if _mcp_transport.user_key_mode:
+    _install_user_key_mode(mcp)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Unauthenticated liveness probe for container healthchecks and Traefik."""
+    return JSONResponse({"status": "ok"})
 
 
 def _require() -> tuple[UniFiClient, Registry]:
