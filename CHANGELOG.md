@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/admin` page in `MCP_AUTH_MODE=entra` (fork): admins sign in with Microsoft and need the Entra app role `MCP_ENTRA_ADMIN_ROLE` (default `UniFi.Admin`). They can add a Fabric key (tested against `/v1/hosts` first, stored encrypted), test it or remove it, and the change applies on the next request without a redeploy. These keys are used alongside `UNIFI_API_KEYS`, and the server now starts in this mode without any configured key.
 - Unauthenticated `GET /health` liveness route.
 
+- `find_hosts` tool: a compact index of every console (id, name, hostname, MAC, model, firmware, state, IP, `_keyLabel`), optionally filtered by name, model, IP or MAC. With hundreds of consoles the full `list_hosts` records are too large for an assistant to read in one response; this gives the exact names and ids to pass as `host`. `list_hosts` and `get_host` are unchanged.
+
 ### Changed
 - With several API keys configured (one per Fabric), the fleet tools `list_all_devices`, `list_all_clients`, `get_fleet_summary`, `search_device_fleet` and `list_devices` (without `host`) now cover every key's org when no `key_label` is given, instead of only the first key. Records are tagged with `_keyLabel`, `get_fleet_summary` adds a per-key `byKey` breakdown, and a failing key is reported under `errors` without hiding the others. Passing `key_label` still scopes to one key.
 

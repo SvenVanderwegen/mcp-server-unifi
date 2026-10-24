@@ -13,7 +13,7 @@ Several collection tools accept a `filter` expression forwarded unchanged to the
 - **A valid property with a non-matching value returns an empty set, not an error.** `{data: [], totalCount: 0}` can mean either "no records match" or "the value never matches this field"; it is not proof the filter is malformed. Only an *invalid property* raises HTTP 400.
 - Each tool's own docstring lists live-verified example expressions valid for that endpoint.
 
-Total tools: 283
+Total tools: 284
 
 ## Tool Categories
 
@@ -25,7 +25,7 @@ Total tools: 283
 - [Device Management](#device-management) (4)
 - [Execute & Actions](#execute--actions) (7)
 - [Listing & Discovery](#listing--discovery) (83)
-- [Other](#other) (25)
+- [Other](#other) (26)
 - [Reading & Inspection](#reading--inspection) (75)
 - [Search](#search) (2)
 - [Update](#update) (40)
@@ -3159,7 +3159,7 @@ host: console name, ID, or composite ID (MAC:numericId format). site: site name 
 
 ## Other
 
-**25 tools**
+**26 tools**
 
 ### `alarm_hub_trigger_output`
 
@@ -3543,6 +3543,28 @@ See fabric_connector_get for host/path/site/scope semantics. body: the JSON requ
 | `body` | `object | null` | no | `null` | the JSON request body. |
 | `confirm` | `boolean` | no | `false` |  |
 | `scope` | `string | null` | no | `null` |  |
+
+**Return type**
+
+`dict[str, Any]`
+
+### `find_hosts`
+
+Find consoles by name, MAC, model or IP: one short line per console.
+
+Returns id, name, hostname, mac, model, firmware, state, ipAddress and (with
+several API keys) _keyLabel for every console, sorted by name. Use it to look up
+the exact name or id of a console when there are many: full list_hosts records
+are large. query (optional) keeps consoles whose name, hostname, id, model or IP
+contains it (case-insensitive), or whose MAC equals it in any notation
+(aa:bb:cc:dd:ee:ff, AABBCCDDEEFF). Pass the returned name or id as `host` to
+per-console tools; get_host gives the full record of one console.
+
+**Parameters**
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `query` | `string | null` | no | `null` |  |
 
 **Return type**
 

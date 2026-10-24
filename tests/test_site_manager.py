@@ -1110,3 +1110,105 @@ async def test_list_devices_without_host_covers_every_key(multikey_client, multi
     assert result["count"] == 2
     assert {d["_keyLabel"] for d in result["devices"]} == {"alpha", "beta"}
     assert result["key_labels"] == ["alpha", "beta"]
+
+
+# --- find_hosts: compact console index ---
+
+_FIND_HOSTS = [
+    {
+        "id": "02AA00000001000000000000000000000000000000000000000000000000:111",
+        "ipAddress": "198.51.100.10",
+        "type": "console",
+        "reportedState": {
+            "name": "Example Fresh (Testville)",
+            "hostname": "UDM-Pro",
+            "version": "4.0.0",
+            "state": "connected",
+            "hardware": {"mac": "02AA00000001", "shortname": "UDMPRO"},
+            "location": {"lat": 1.0, "long": 2.0},
+        },
+    },
+    {
+        "id": "0aa00000-0000-4000-8000-000000000002",
+        "reportedState": {"name": "Alpha Office", "mac": "02:aa:00:00:00:02"},
+    },
+]
+
+
+async def test_find_hosts_returns_one_short_row_per_console_sorted_by_name():
+    from unifi_fabric.tools.site_manager import find_hosts
+
+    client = UniFiClient(Settings(api_key="test-key"))
+    client.paginate = AsyncMock(return_value=list(_FIND_HOSTS))
+    result = await find_hosts(client, Registry(client))
+    assert result["count"] == 2
+    first, second = result["hosts"]
+    assert first["name"] == "Alpha Office" and first["mac"] == "02:aa:00:00:00:02"
+    assert second == {
+        "id": _FIND_HOSTS[0]["id"],
+        "name": "Example Fresh (Testville)",
+        "hostname": "UDM-Pro",
+        "mac": "02AA00000001",
+        "model": "UDMPRO",
+        "firmware": "4.0.0",
+        "state": "connected",
+        "ipAddress": "198.51.100.10",
+        "type": "console",
+    }
+
+
+@pytest.mark.parametrize(
+    ("query", "names"),
+    [
+        ("fresh (test", ["Example Fresh (Testville)"]),
+        ("02-AA-00-00-00-02", ["Alpha Office"]),
+        ("udmpro", ["Example Fresh (Testville)"]),
+        ("nothing like this", []),
+        ("  ", ["Alpha Office", "Example Fresh (Testville)"]),
+    ],
+)
+async def test_find_hosts_filters_on_name_mac_and_model(query, names):
+    from unifi_fabric.tools.site_manager import find_hosts
+
+    client = UniFiClient(Settings(api_key="test-key"))
+    client.paginate = AsyncMock(return_value=list(_FIND_HOSTS))
+    result = await find_hosts(client, Registry(client), query=query)
+    assert [h["name"] for h in result["hosts"]] == names
+
+
+async def test_find_hosts_covers_every_key(multikey_client, multikey_registry):
+    from unifi_fabric.tools.site_manager import find_hosts
+
+    async def by_key(path, key=None, **kwargs):
+        if key.label == "beta":
+            return list(_FIND_HOSTS)
+        return [{"id": "console-alpha-1", "reportedState": {"name": "Zulu HQ"}}]
+
+    multikey_client.paginate = AsyncMock(side_effect=by_key)
+    result = await find_hosts(multikey_client, multikey_registry, query="02aa00000001")
+    assert [(h["name"], h["_keyLabel"]) for h in result["hosts"]] == [
+        ("Example Fresh (Testville)", "beta")
+    ]
+    # The lists are cached, so a per-console tool resolves the beta key without refetching.
+    calls = multikey_client.paginate.await_count
+    key = await multikey_registry.resolve_key_for_host("Example Fresh (Testville)")
+    assert key.label == "beta" and multikey_client.paginate.await_count == calls
+
+
+async def test_find_hosts_reports_a_failing_key_and_fails_when_all_do(
+    multikey_client, multikey_registry
+):
+    from unifi_fabric.tools.site_manager import find_hosts
+
+    async def beta_down(path, key=None, **kwargs):
+        if key.label == "beta":
+            raise UniFiConnectionError("HTTP 401")
+        return [{"id": "console-alpha-1", "reportedState": {"name": "Zulu HQ"}}]
+
+    multikey_client.paginate = AsyncMock(side_effect=beta_down)
+    result = await find_hosts(multikey_client, multikey_registry)
+    assert result["count"] == 1 and result["errors"] == ["beta: HTTP 401"]
+
+    multikey_client.paginate = AsyncMock(side_effect=UniFiConnectionError("down"))
+    with pytest.raises(RuntimeError, match="All 2 API key"):
+        await find_hosts(multikey_client, Registry(multikey_client))

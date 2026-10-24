@@ -128,6 +128,8 @@ Site Manager (Fabric) API.
 
 ## Getting Started
 1. Call `list_hosts` to discover available consoles. Note the host name (e.g., "MyConsole").
+   With many consoles, `find_hosts` gives one short line per console and filters by
+   name or MAC.
 2. Call `list_sites` to discover sites. Note the site name (e.g., "Default").
 3. Pass these names to any per-host tool: `list_networks(host="MyConsole", site="Default")`.
 
@@ -517,6 +519,24 @@ async def list_hosts(
     """
     client, registry = _require()
     return await site_manager.list_hosts(client, registry, page_token=page_token)
+
+
+@mcp.tool()
+async def find_hosts(
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Find consoles by name, MAC, model or IP: one short line per console.
+
+    Returns id, name, hostname, mac, model, firmware, state, ipAddress and (with
+    several API keys) _keyLabel for every console, sorted by name. Use it to look up
+    the exact name or id of a console when there are many: full list_hosts records
+    are large. query (optional) keeps consoles whose name, hostname, id, model or IP
+    contains it (case-insensitive), or whose MAC equals it in any notation
+    (aa:bb:cc:dd:ee:ff, AABBCCDDEEFF). Pass the returned name or id as `host` to
+    per-console tools; get_host gives the full record of one console.
+    """
+    client, registry = _require()
+    return await site_manager.find_hosts(client, registry, query=query)
 
 
 @mcp.tool()
