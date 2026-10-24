@@ -339,6 +339,9 @@ def build_auth(s: MCPTransportSettings) -> AuthProvider | None:
     - ``"user_key"`` -> ``UserKeyOAuthProvider``: this server is its own OAuth
       authorization server and each user logs in with their own UniFi API key
       (see ``user_oauth``)
+    - ``"entra"`` -> ``EntraOAuthProvider``: this server is its own OAuth
+      authorization server, users sign in with Microsoft Entra and every call
+      uses the server's own ``UNIFI_API_KEYS`` (see ``entra_oauth``)
     - ``"oauth"``  -> ``RemoteAuthProvider`` wrapping a ``JWTVerifier`` (this server
       is an OAuth 2.0 **resource server**: it verifies bearer JWTs minted by an
       external authorization server and advertises itself via the
@@ -362,6 +365,11 @@ def build_auth(s: MCPTransportSettings) -> AuthProvider | None:
 
         store = OAuthStore(s.oauth_db_path, s.secret_key)
         return UserKeyOAuthProvider(s, store, get_settings().api_base_url)
+    if mode == "entra":
+        from .entra_oauth import EntraOAuthProvider
+        from .oauth_store import OAuthStore
+
+        return EntraOAuthProvider(s, OAuthStore(s.oauth_db_path, s.secret_key))
     if mode == "oauth":
         from fastmcp.server.auth import RemoteAuthProvider
         from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -449,8 +457,21 @@ def _install_user_key_mode(app: FastMCP) -> None:
     app.add_middleware(UserKeyMiddleware(provider.store))
 
 
+def _install_entra_mode(app: FastMCP) -> None:
+    """Microsoft sign-in callback and tool-call audit log for ``MCP_AUTH_MODE=entra``."""
+    from .entra_oauth import AuditMiddleware, EntraOAuthProvider, install_entra_routes
+
+    provider = app.auth
+    if not isinstance(provider, EntraOAuthProvider):
+        raise RuntimeError("MCP_AUTH_MODE=entra requires the Entra OAuth provider")
+    install_entra_routes(app, provider)
+    app.add_middleware(AuditMiddleware())
+
+
 if _mcp_transport.user_key_mode:
     _install_user_key_mode(mcp)
+elif _mcp_transport.entra_mode:
+    _install_entra_mode(mcp)
 
 
 @mcp.custom_route("/health", methods=["GET"])
